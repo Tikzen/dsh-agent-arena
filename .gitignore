@@ -1,0 +1,17 @@
+node_modules/
+.DS_Store
+*.log
+coverage/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.db
+*.sqlite
+*.sqlite3
+*.jsonl
+*.tgz
+.dsh/
+meetings.json
