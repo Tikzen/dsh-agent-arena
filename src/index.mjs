@@ -37,17 +37,47 @@ const nowIso = () => new Date().toISOString()
 const safeError = error => error instanceof Error ? error.message : String(error)
 const COOLDOWN_MS = 60_000
 const CHANNEL_WINDOW_MS = 60_000
-const CHANNEL_REQUEST_LIMIT = 55
+const DEFAULT_CHANNEL_REQUEST_LIMIT = 55
+const DEFAULT_COOLDOWN_ERROR_STATUSES = Object.freeze([429, 500])
 const RATE_LIMIT_RE = /(?:429|rate.?limit|too many requests|频率|限流|请求过于频繁)/i
+const RETRY_CHANNEL_EXHAUSTED_RE = /(?:get_channel_failed|可用渠道不存在[（(]retry[）)]|upstream rate limit exceeded)/i
+const EMPTY_RESPONSE_RE = /(?:EMPTY_RESPONSE|returned a completed response with no content)/i
 
 export function arenaChannelKey(selection) {
   return String(selection?.provider || 'default')
 }
 
-export function isArenaRateLimitFailure(value) {
+export function normalizeArenaRequestLimit(value) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 10_000 ? parsed : DEFAULT_CHANNEL_REQUEST_LIMIT
+}
+
+export function normalizeArenaCooldownStatuses(value) {
+  if (!Array.isArray(value)) return [...DEFAULT_COOLDOWN_ERROR_STATUSES]
+  return [...new Set(value.map(Number).filter(status => Number.isInteger(status) && status >= 100 && status <= 599))].slice(0, 20)
+}
+
+function arenaFailureStatus(value) {
   const failure = value?.failure && typeof value.failure === 'object' ? value.failure : value
-  return Number(failure?.status) === 429
-    || RATE_LIMIT_RE.test(`${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`)
+  const description = `${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`
+  const explicit = Number(failure?.status ?? failure?.statusCode ?? failure?.status_code)
+  if (Number.isInteger(explicit) && explicit >= 100 && explicit <= 599) return explicit
+  const embedded = description.match(/(?:^|\D)([1-5]\d{2})(?=\D|$)/)
+  if (embedded) return Number(embedded[1])
+  if (RATE_LIMIT_RE.test(description)) return 429
+  // 部分中转服务先收到真实 429，重试所有渠道后却向 DSH 包装成
+  // 500/get_channel_failed；无法取得显式状态码时按 500 处理。
+  if (RETRY_CHANNEL_EXHAUSTED_RE.test(description)) return 500
+  return 0
+}
+
+export function isArenaRateLimitFailure(value, configuredStatuses = DEFAULT_COOLDOWN_ERROR_STATUSES) {
+  return normalizeArenaCooldownStatuses(configuredStatuses).includes(arenaFailureStatus(value))
+}
+
+export function isArenaEmptyResponseFailure(value) {
+  const failure = value?.failure && typeof value.failure === 'object' ? value.failure : value
+  return EMPTY_RESPONSE_RE.test(`${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`)
 }
 
 function createArenaUserMessage(text) {
@@ -273,6 +303,8 @@ export function apply(ctx, config = {}) {
     settings: {
       rateLimitCooldownEnabled: false,
       channelQueueEnabled: false,
+      channelRequestsPerMinute: DEFAULT_CHANNEL_REQUEST_LIMIT,
+      cooldownErrorStatuses: [...DEFAULT_COOLDOWN_ERROR_STATUSES],
       autoReplyEnabled: true,
     },
     administrator: {
@@ -884,6 +916,8 @@ export function apply(ctx, config = {}) {
         ...profiles.settings,
         rateLimitCooldownEnabled: stored.profiles.settings.rateLimitCooldownEnabled === true,
         channelQueueEnabled: stored.profiles.settings.channelQueueEnabled === true,
+        channelRequestsPerMinute: normalizeArenaRequestLimit(stored.profiles.settings.channelRequestsPerMinute),
+        cooldownErrorStatuses: normalizeArenaCooldownStatuses(stored.profiles.settings.cooldownErrorStatuses),
         autoReplyEnabled: stored.profiles.settings.autoReplyEnabled !== false,
       }
       if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator' }
@@ -1012,6 +1046,8 @@ export function apply(ctx, config = {}) {
       ...profiles.settings,
       rateLimitCooldownEnabled: raw.rateLimitCooldownEnabled === true,
       channelQueueEnabled: raw.channelQueueEnabled === true,
+      channelRequestsPerMinute: normalizeArenaRequestLimit(raw.channelRequestsPerMinute),
+      cooldownErrorStatuses: normalizeArenaCooldownStatuses(raw.cooldownErrorStatuses),
       autoReplyEnabled: raw.autoReplyEnabled !== false,
     }
     await persist()
@@ -1119,7 +1155,7 @@ export function apply(ctx, config = {}) {
 
   function markChannelFailure(selection, error) {
     if (!profiles.settings.rateLimitCooldownEnabled) return
-    if (!isArenaRateLimitFailure(error)) return
+    if (!isArenaRateLimitFailure(error, profiles.settings.cooldownErrorStatuses)) return
     const retryAfterMs = Number(error?.providerRetryAfterMs ?? error?.failure?.providerRetryAfterMs)
     const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? Math.max(COOLDOWN_MS, retryAfterMs) : COOLDOWN_MS
     channelCooldowns.set(arenaChannelKey(selection), Date.now() + delayMs)
@@ -1176,7 +1212,8 @@ export function apply(ctx, config = {}) {
     while (true) {
       const now = Date.now()
       const recent = (channelRequestTimes.get(key) || []).filter(timestamp => timestamp > now - CHANNEL_WINDOW_MS)
-      if (recent.length < CHANNEL_REQUEST_LIMIT) {
+      const requestLimit = normalizeArenaRequestLimit(profiles.settings.channelRequestsPerMinute)
+      if (recent.length < requestLimit) {
         recent.push(now)
         channelRequestTimes.set(key, recent)
         return
@@ -1373,7 +1410,7 @@ export function apply(ctx, config = {}) {
     return () => { clearInterval(timer); scan() }
   }
 
-  async function runFullAgentTurn(handle, prompt, runtime, profile, phase = 'work') {
+  async function runFullAgentTurnOnce(handle, prompt, runtime, profile, phase = 'work') {
     if (runtime.abort.signal.aborted) throw new Error('任务已终止')
     await handle.agent.whenIdle()
     const firstSeq = handle.agent.session.seq
@@ -1397,11 +1434,40 @@ export function apply(ctx, config = {}) {
     }
     const outcome = summarizeAgentTurn(handle.agent.session.events, firstSeq)
     if (outcome.error) {
-      setRoleActivity(runtime.container, profile, { status: 'error', stage: '本轮运行失败', detail: outcome.error, currentTool: '' }, outcome.error, 'error')
-      throw new Error(outcome.error)
+      const failure = new Error(outcome.error)
+      failure.autonomousMessageIds = [...(messageTurn?.messageIds ?? [])]
+      if (!isArenaEmptyResponseFailure(failure)) {
+        setRoleActivity(runtime.container, profile, { status: 'error', stage: '本轮运行失败', detail: outcome.error, currentTool: '' }, outcome.error, 'error')
+      }
+      throw failure
     }
     setRoleActivity(runtime.container, profile, { status: 'working', stage: phase === 'ack' ? '已确认，准备正式工作' : '本轮工作已完成', currentTool: '' })
     return { ...outcome, autonomousMessageIds: [...(messageTurn?.messageIds ?? [])] }
+  }
+
+  async function runFullAgentTurn(handle, prompt, runtime, profile, phase = 'work') {
+    try {
+      return await runFullAgentTurnOnce(handle, prompt, runtime, profile, phase)
+    } catch (error) {
+      if (!isArenaEmptyResponseFailure(error) || runtime.abort.signal.aborted || runtime.cancelCurrentWork) throw error
+      const firstMessageIds = Array.isArray(error?.autonomousMessageIds) ? error.autonomousMessageIds : []
+      if (firstMessageIds.length) {
+        return { text: '', stopReason: 'empty-response', error: '', autonomousMessageIds: firstMessageIds, silent: true }
+      }
+      setRoleActivity(runtime.container, profile, {
+        status: 'thinking', stage: '本轮返回为空，正在自动重试', detail: '', currentTool: '',
+      }, '检测到空响应，自动重试一次')
+      try {
+        return await runFullAgentTurnOnce(handle, prompt, runtime, profile, phase)
+      } catch (retryError) {
+        if (!isArenaEmptyResponseFailure(retryError) || runtime.abort.signal.aborted || runtime.cancelCurrentWork) throw retryError
+        return {
+          text: '', stopReason: 'empty-response', error: '',
+          autonomousMessageIds: Array.isArray(retryError?.autonomousMessageIds) ? retryError.autonomousMessageIds : [],
+          silent: true,
+        }
+      }
+    }
   }
 
   function latestHumanRequest(container, isMeeting) {
@@ -1546,6 +1612,7 @@ export function apply(ctx, config = {}) {
 
   async function runMeetingAdmin(meeting, command, runtime) {
     const admin = meeting.administratorProfile
+    let failed = false
     setRoleActivity(meeting, admin, { status: 'working', stage: '正在处理管理指令', detail: command.slice(0, 240), currentTool: '' }, '开始处理管理指令')
     try {
       const result = await askAdministrator(meeting, command, runtime.parent, runtime, true)
@@ -1555,10 +1622,10 @@ export function apply(ctx, config = {}) {
       })
       await applyMeetingAdminAction(meeting, runtime, result)
     } catch (error) {
-      appendSystem(meeting, `管理员处理失败：${safeError(error)}`, true)
+      failed = true
       setRoleActivity(meeting, admin, { status: 'error', stage: '管理指令处理失败', detail: safeError(error) }, safeError(error), 'error')
     } finally {
-      setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', currentTool: '' })
+      if (!failed) setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', currentTool: '' })
     }
   }
 
@@ -1573,6 +1640,7 @@ export function apply(ctx, config = {}) {
 
   async function runOne(meeting, participant, runtime) {
     if (isMuted(meeting, participant.id)) return
+    let failed = false
     participant.status = 'working'
     meeting.updatedAt = nowIso()
     await persist()
@@ -1585,6 +1653,7 @@ export function apply(ctx, config = {}) {
       const result = await runFullAgentTurn(handle, participantPrompt(meeting, participant, coordinationPrompt(runtime, participant.id)), runtime, participant, 'work')
       if (runtime.abort.signal.aborted || runtime.cancelCurrentWork) return
       if (isMuted(meeting, participant.id)) return
+      if (result.silent && !result.autonomousMessageIds.length) return
       if (!result.autonomousMessageIds.length) {
         meeting.transcript.push({
           id: randomUUID(), kind: 'participant', phase: 'result', turn: meeting.turnCount, speakerId: participant.id,
@@ -1595,18 +1664,16 @@ export function apply(ctx, config = {}) {
       }
     } catch (error) {
       if (runtime.cancelCurrentWork || runtime.abort.signal.aborted) return
+      failed = true
       setRoleActivity(meeting, participant, { status: 'error', stage: '本轮工作失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-      if (!runtime.abort.signal.aborted && !isMuted(meeting, participant.id)) meeting.transcript.push({
-        id: randomUUID(), kind: 'participant', turn: meeting.turnCount, speakerId: participant.id,
-        speaker: participant.name, avatar: participant.avatar, text: `发言失败：${safeError(error)}`,
-        createdAt: nowIso(), failed: true,
-      })
     } finally {
       releaseRoleClaims(runtime, participant.id)
       participant.status = 'idle'
-      setRoleActivity(meeting, participant, isMuted(meeting, participant.id)
-        ? { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] }
-        : { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      if (isMuted(meeting, participant.id)) {
+        setRoleActivity(meeting, participant, { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] })
+      } else if (!failed) {
+        setRoleActivity(meeting, participant, { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      }
       meeting.updatedAt = nowIso()
       await persist().catch(() => undefined)
     }
@@ -1620,6 +1687,7 @@ export function apply(ctx, config = {}) {
     const available = container.participants.filter(item => !isMuted(container, item.id))
     return Promise.all(available.map(async profile => {
       if (profile.autoReplyDisabled) return { profile, shouldSpeak: true, reason: '此角色已关闭独立判断，请管理员直接判断它是否适合接话。' }
+      let failed = false
       setRoleActivity(container, profile, { status: 'thinking', stage: '正在判断是否需要接话', detail: '', currentTool: '' })
       try {
         const result = await startRoleRun({
@@ -1646,10 +1714,11 @@ export function apply(ctx, config = {}) {
         const intent = result.structured && typeof result.structured === 'object' ? result.structured : {}
         return { profile, shouldSpeak: intent.shouldSpeak === true, reason: String(intent.reason || '').trim().slice(0, 500) }
       } catch (error) {
+        failed = true
         setRoleActivity(container, profile, { status: 'error', stage: '接话判断失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
         return { profile, shouldSpeak: false, reason: `判断失败：${safeError(error)}` }
       } finally {
-        setRoleActivity(container, profile, { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '' })
+        if (!failed) setRoleActivity(container, profile, { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '' })
       }
     }))
   }
@@ -1657,6 +1726,7 @@ export function apply(ctx, config = {}) {
   async function guardContinuation(container, intents, runtime, isMeeting) {
     if (!intents.length) return { onTopic: true, complete: true, approvedSpeakerIds: [], reason: '没有角色希望继续接话。' }
     const admin = container.administratorProfile
+    let failed = false
     const focus = latestHumanRequest(container, isMeeting)
     setRoleActivity(container, admin, { status: 'working', stage: '正在检查跑题与刷屏风险', detail: '', currentTool: '' }, '复核角色接话意愿')
     try {
@@ -1687,9 +1757,11 @@ export function apply(ctx, config = {}) {
         reason: String(decision.reason || '').trim(),
       }
     } catch (error) {
+      failed = true
+      setRoleActivity(container, admin, { status: 'error', stage: '接话复核失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
       return { onTopic: true, complete: false, approvedSpeakerIds: [intents[0].profile.id], reason: `管理员复核失败，采用首位角色的独立判断：${safeError(error)}` }
     } finally {
-      setRoleActivity(container, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (!failed) setRoleActivity(container, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
     }
   }
 
@@ -1712,9 +1784,9 @@ export function apply(ctx, config = {}) {
       for (const id of next.length ? next : intents.slice(0, 1).map(item => item.profile.id)) runtime.targetIds.add(id)
       runtime.triggerSource = 'auto'
     } catch (error) {
-      appendSystem(meeting, `逐角色接话判断失败，已先等待你的下一条消息：${safeError(error)}`, true)
+      setRoleActivity(meeting, admin, { status: 'error', stage: '接话判断流程失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
-      setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (roleActivity(meeting, admin).status !== 'error') setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
     }
   }
 
@@ -1788,7 +1860,6 @@ export function apply(ctx, config = {}) {
           runtime.summaryRequested = false
           await runStageSummary(meeting, runtime).catch(error => {
             setRoleActivity(meeting, meeting.administratorProfile, { status: 'error', stage: '阶段总结失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-            appendSystem(meeting, `阶段总结失败：${safeError(error)}`, true)
           })
           await persist()
           runtime.pauseRequested = true
@@ -1819,6 +1890,9 @@ export function apply(ctx, config = {}) {
       }
     } catch (error) {
       meeting.error = runtime.abort.signal.aborted ? null : safeError(error)
+      if (!runtime.abort.signal.aborted) setRoleActivity(meeting, meeting.administratorProfile, {
+        status: 'error', stage: '会议运行流程失败', detail: safeError(error), currentTool: '',
+      }, safeError(error), 'error')
     } finally {
       const restartRequest = !runtime.abort.signal.aborted && !runtime.pauseRequested && (
         runtime.targetIds.size || runtime.adminCommands.length || runtime.summaryRequested
@@ -2045,6 +2119,7 @@ export function apply(ctx, config = {}) {
 
   async function runRoomAi(room, profile, runtime) {
     if (isMuted(room, profile.id)) return
+    let failed = false
     room.respondingProfileIds = [...new Set([...(room.respondingProfileIds ?? []), profile.id])]
     room.respondingProfileId = room.respondingProfileIds[0] ?? null
     await persist()
@@ -2054,6 +2129,7 @@ export function apply(ctx, config = {}) {
       await persist()
       const result = await runFullAgentTurn(handle, chatPrompt(room, profile, coordinationPrompt(runtime, profile.id)), runtime, profile, 'work')
       if (!runtime.abort.signal.aborted && !isMuted(room, profile.id)) {
+        if (result.silent && !result.autonomousMessageIds.length) return
         if (!result.autonomousMessageIds.length) {
           if (!result.text) throw new Error(`本轮没有产生可展示文本，结束原因：${result.stopReason}`)
           room.messages.push({
@@ -2063,13 +2139,15 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch (error) {
+      failed = true
       setRoleActivity(room, profile, { status: 'error', stage: '本轮回复失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-      if (!runtime.abort.signal.aborted && !isMuted(room, profile.id)) appendSystem(room, `${profile.name} 回复失败：${safeError(error)}`, false)
     } finally {
       releaseRoleClaims(runtime, profile.id)
-      setRoleActivity(room, profile, isMuted(room, profile.id)
-        ? { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] }
-        : { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      if (isMuted(room, profile.id)) {
+        setRoleActivity(room, profile, { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] })
+      } else if (!failed) {
+        setRoleActivity(room, profile, { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      }
       room.respondingProfileIds = (room.respondingProfileIds ?? []).filter(id => id !== profile.id)
       room.respondingProfileId = room.respondingProfileIds[0] ?? null
       room.updatedAt = nowIso()
@@ -2079,6 +2157,7 @@ export function apply(ctx, config = {}) {
 
   async function runRoomAdmin(room, command, runtime) {
     const admin = room.administratorProfile
+    let failed = false
     setRoleActivity(room, admin, { status: 'working', stage: '正在处理管理指令', detail: command.slice(0, 240), currentTool: '' }, '开始处理管理指令')
     try {
       const result = await askAdministrator(room, command, runtime.parent, runtime, false)
@@ -2091,10 +2170,10 @@ export function apply(ctx, config = {}) {
         appendSystem(room, `管理员已将群聊话题更改为：${room.name}`, false)
       } else if (result.action === 'continue') room.participants.filter(item => !isMuted(room, item.id)).forEach(item => runtime.targetIds.add(item.id))
     } catch (error) {
-      appendSystem(room, `管理员处理失败：${safeError(error)}`, false)
+      failed = true
       setRoleActivity(room, admin, { status: 'error', stage: '管理指令处理失败', detail: safeError(error) }, safeError(error), 'error')
     } finally {
-      setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (!failed) setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
     }
   }
 
@@ -2114,9 +2193,9 @@ export function apply(ctx, config = {}) {
       const next = decision.approvedSpeakerIds.filter(id => candidates.has(id) && !isMuted(room, id)).slice(0, 1)
       for (const id of next.length ? next : intents.slice(0, 1).map(item => item.profile.id)) runtime.targetIds.add(id)
     } catch (error) {
-      appendSystem(room, `逐角色接话判断失败，已先等待你的下一条消息：${safeError(error)}`, false)
+      setRoleActivity(room, admin, { status: 'error', stage: '接话判断流程失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
-      setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (roleActivity(room, admin).status !== 'error') setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
     }
   }
 
@@ -2144,7 +2223,12 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch (error) {
-      if (!runtime.abort.signal.aborted) appendSystem(room, `回复流程失败：${safeError(error)}`, false)
+      if (!runtime.abort.signal.aborted) {
+        const owner = room.administratorProfile || room.participants[0]
+        if (owner) setRoleActivity(room, owner, {
+          status: 'error', stage: '聊天运行流程失败', detail: safeError(error), currentTool: '',
+        }, safeError(error), 'error')
+      }
     } finally {
       room.status = 'idle'
       room.respondingProfileId = null

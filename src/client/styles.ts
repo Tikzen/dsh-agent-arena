@@ -320,6 +320,18 @@ export const ARENA_CSS = String.raw`
 .arena-toggle small, .arena-field-hint { color: var(--dsw-alias-label-caption, #777883); font-size: 9px; line-height: 1.5; }
 .arena-toggle--ai-reply { margin: 4px 0 12px; padding: 10px 12px; border: 1px solid color-mix(in srgb, #7665e8 30%, var(--dsw-alias-border-l1, #ddd)); border-radius: 12px; background: rgba(118,101,232,.05); }
 .arena-toggle--admin { margin: 14px 0 8px; padding: 10px 12px; border: 1px solid color-mix(in srgb, #7665e8 30%, var(--dsw-alias-border-l1, #ddd)); border-radius: 12px; background: rgba(118,101,232,.05); }
+.arena-setting-control { display: grid; gap: 9px; margin: 10px 0 14px 23px; padding: 11px 12px; border: 1px solid var(--dsw-alias-border-l1, #dddde5); border-radius: 11px; background: color-mix(in srgb, var(--dsw-alias-bg-base, #fff) 96%, #7665e8); }
+.arena-setting-control > div:first-child, .arena-setting-control > span { display: grid; gap: 3px; }
+.arena-setting-control strong { font-size: 10px; }
+.arena-setting-control small { color: var(--dsw-alias-label-caption, #777883); font-size: 8px; line-height: 1.5; }
+.arena-setting-control--inline { grid-template-columns: minmax(0, 1fr) 110px; align-items: center; cursor: default; }
+.arena-setting-control--inline > .arena-input { text-align: center; }
+.arena-status-editor { display: grid; gap: 8px; }
+.arena-status-chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 25px; align-items: center; }
+.arena-status-chips > span { display: inline-flex; align-items: center; gap: 5px; padding: 5px 6px 5px 9px; border-radius: 999px; background: rgba(220,76,90,.1); color: #c53d4b; font-size: 9px; font-weight: 700; }
+.arena-status-chips > span button { display: grid; place-items: center; width: 15px; height: 15px; padding: 0; border: 0; border-radius: 99px; background: rgba(220,76,90,.13); color: inherit; cursor: pointer; font-size: 12px; line-height: 1; }
+.arena-status-chips > em { color: var(--dsw-alias-label-caption, #777883); font-size: 8px; font-style: normal; }
+.arena-status-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
 .arena-setting-help--admin { margin-top: 8px; }
 .arena-admin-editor .arena-model-picker { grid-template-columns: 1fr 1fr auto; }
 .arena-admin-save { min-height: 39px; white-space: nowrap; }
@@ -574,6 +586,7 @@ export const ARENA_CSS = String.raw`
 .arena-role-monitor__head p { margin: 3px 0 0; color: var(--dsw-alias-label-caption, #777883); font-size: 8px; line-height: 1.4; }
 .arena-role-monitor__head > span { flex: none; padding: 4px 6px; border-radius: 999px; background: color-mix(in srgb, var(--dsw-alias-border-l1, #ddd) 45%, transparent); color: var(--dsw-alias-label-caption, #777883); font-size: 8px; font-weight: 700; }
 .arena-role-monitor__head > span[data-active="true"] { background: rgba(44,201,164,.13); color: #159b7f; }
+.arena-role-monitor__head > span[data-error="true"] { background: rgba(220,76,90,.13); color: #dc4c5a; }
 .arena-role-monitor__list { display: grid; gap: 7px; margin-top: 10px; }
 .arena-role-activity { overflow: hidden; border: 1px solid var(--dsw-alias-border-l1, #dddde5); border-radius: 11px; background: color-mix(in srgb, var(--dsw-alias-bg-base, #fff) 96%, #7665e8); }
 .arena-role-activity[data-status="error"] { border-color: rgba(220,76,90,.45); }
@@ -668,6 +681,9 @@ export const ARENA_CSS = String.raw`
   .arena-selected-grid { grid-template-columns: 1fr; }
   .arena-human-editor, .arena-ai-editor, .arena-admin-editor { grid-template-columns: 1fr; }
   .arena-model-picker { grid-template-columns: 1fr; }
+  .arena-setting-control { margin-left: 0; }
+  .arena-setting-control--inline { grid-template-columns: 1fr; }
+  .arena-setting-control--inline > .arena-input { width: 100%; }
   .arena-crop-dialog { padding: 14px; }
   .arena-fab { right: 14px; bottom: 14px; }
   .arena-fab__label { display: none; }

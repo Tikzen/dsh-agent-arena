@@ -138,7 +138,17 @@ interface Meeting {
 interface ArenaSettings {
   rateLimitCooldownEnabled: boolean
   channelQueueEnabled: boolean
+  channelRequestsPerMinute: number
+  cooldownErrorStatuses: number[]
   autoReplyEnabled: boolean
+}
+
+const DEFAULT_ARENA_SETTINGS: ArenaSettings = {
+  rateLimitCooldownEnabled: false,
+  channelQueueEnabled: false,
+  channelRequestsPerMinute: 55,
+  cooldownErrorStatuses: [429, 500],
+  autoReplyEnabled: true,
 }
 
 interface UserProfile {
@@ -755,7 +765,7 @@ function ProfilesView(props: {
   const [savingAi, setSavingAi] = useState(false)
   const [message, setMessage] = useState('')
   const [profileErrors, setProfileErrors] = useState<Record<string, string>>({})
-  const [preferences, setPreferences] = useState<ArenaSettings>(settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true })
+  const [preferences, setPreferences] = useState<ArenaSettings>(settings ?? { ...DEFAULT_ARENA_SETTINGS })
 
   useEffect(() => {
     if (profiles?.human) setHuman(profiles.human)
@@ -767,7 +777,7 @@ function ProfilesView(props: {
 
   useEffect(() => {
     if (settings) setPreferences(settings)
-  }, [settings?.rateLimitCooldownEnabled, settings?.channelQueueEnabled, settings?.autoReplyEnabled])
+  }, [settings?.rateLimitCooldownEnabled, settings?.channelQueueEnabled, settings?.channelRequestsPerMinute, settings?.cooldownErrorStatuses?.join(','), settings?.autoReplyEnabled])
 
   useEffect(() => {
     if (draft.provider || modelCatalog.length === 0) return
@@ -973,12 +983,25 @@ function ProfilesView(props: {
 }
 
 function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (settings: ArenaSettings) => void }): ReactNode {
-  const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true })
+  const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { ...DEFAULT_ARENA_SETTINGS })
+  const [statusDraft, setStatusDraft] = useState('')
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
   useEffect(() => {
     if (props.settings) setSettings(props.settings)
-  }, [props.settings?.rateLimitCooldownEnabled, props.settings?.channelQueueEnabled, props.settings?.autoReplyEnabled])
+  }, [props.settings?.rateLimitCooldownEnabled, props.settings?.channelQueueEnabled, props.settings?.channelRequestsPerMinute, props.settings?.cooldownErrorStatuses?.join(','), props.settings?.autoReplyEnabled])
+  const addStatus = (): void => {
+    const status = Number(statusDraft)
+    if (!Number.isInteger(status) || status < 100 || status > 599) {
+      setMessage('请输入 100–599 之间的 HTTP 错误码。')
+      return
+    }
+    setSettings(current => current.cooldownErrorStatuses.includes(status)
+      ? current
+      : { ...current, cooldownErrorStatuses: [...current.cooldownErrorStatuses, status] })
+    setStatusDraft('')
+    setMessage('')
+  }
   const save = async (): Promise<void> => {
     setSaving(true); setMessage('')
     try {
@@ -990,7 +1013,15 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
   return <div className="arena-profiles"><div className="arena-page-scroll"><div className="arena-kicker">Collaboration behavior</div><h2>协作行为设置</h2><p className="arena-lead">统一配置 Arena 中所有模型请求的共享渠道保护策略。</p>{message ? <div className="arena-page-alert is-success" role="status">{message}</div> : null}
     <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>渠道保护</strong><span>按供应商配置共享计算</span></div>
       <label className="arena-toggle"><input type="checkbox" checked={settings.rateLimitCooldownEnabled} onChange={event => setSettings(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>同一供应商配置触发限流后，所有共享角色一起等待；失败请求也计入渠道次数。</small></span></label>
-      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商下的正式发言、工具续跑、子 Agent 和接话判断统一排队，并按每分钟 55 次的安全额度放行；回复速度可能降低。</small></span></label>
+      <div className="arena-setting-control">
+        <div><strong>触发冷却的错误码</strong><small>默认 429、500；删除某个错误码后，该状态码将不再触发渠道冷却。</small></div>
+        <div className="arena-status-editor">
+          <div className="arena-status-chips">{settings.cooldownErrorStatuses.length ? settings.cooldownErrorStatuses.map(status => <span key={status}>{status}<button type="button" aria-label={`删除错误码 ${status}`} onClick={() => setSettings(current => ({ ...current, cooldownErrorStatuses: current.cooldownErrorStatuses.filter(item => item !== status) }))}>×</button></span>) : <em>未配置错误码</em>}</div>
+          <div className="arena-status-add"><input className="arena-input" type="number" min={100} max={599} placeholder="例如 503" value={statusDraft} onChange={event => setStatusDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addStatus() } }} /><button className="arena-control" type="button" onClick={addStatus}>添加</button></div>
+        </div>
+      </div>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商下的正式发言、工具续跑、子 Agent 和接话判断统一排队；回复速度可能降低。</small></span></label>
+      <label className="arena-setting-control arena-setting-control--inline"><span><strong>每分钟放行次数</strong><small>作用于每个供应商共享队列，可填写 1–10000；保存后从下一次请求开始生效。</small></span><input className="arena-input" type="number" min={1} max={10000} value={settings.channelRequestsPerMinute} onChange={event => setSettings(current => ({ ...current, channelRequestsPerMinute: Number(event.target.value) }))} /></label>
       <details className="arena-setting-help"><summary>为什么按供应商配置计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，无法按密钥精确分组，因此将同一供应商配置下的不同模型视为共享渠道。</p></details>
     </section>
     <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>说明</strong><span>自动接话设置位于用户中心的群管理员面板</span></div>
@@ -1107,21 +1138,27 @@ function RoleMonitor(props: { monitor?: ActivityMonitor }): ReactNode {
       let changed = false
       const next = { ...current }
       for (const role of roles) {
+        if (role.status === 'error' && next[role.profileId] !== true) {
+          next[role.profileId] = true
+          changed = true
+          continue
+        }
         if (next[role.profileId] !== undefined) continue
         next[role.profileId] = ACTIVE_ROLE_ACTIVITY.has(role.status)
         changed = true
       }
       return changed ? next : current
     })
-  }, [roles.map(role => role.profileId).join('|')])
+  }, [roles.map(role => `${role.profileId}:${role.status}`).join('|')])
 
   const activeCount = roles.filter(role => ACTIVE_ROLE_ACTIVITY.has(role.status)).length
+  const errorCount = roles.filter(role => role.status === 'error').length
 
   return (
     <section className="arena-role-monitor">
       <div className="arena-role-monitor__head">
         <div><h3>角色动态</h3><p>实时协作板 · 角色之间可互相查看</p></div>
-        <span data-active={activeCount > 0}>{activeCount ? `${activeCount} 工作中` : '均空闲'}</span>
+        <span data-active={activeCount > 0} data-error={errorCount > 0}>{errorCount ? `${errorCount} 个错误` : activeCount ? `${activeCount} 工作中` : '均空闲'}</span>
       </div>
       <div className="arena-role-monitor__list">
         {roles.map(role => {
