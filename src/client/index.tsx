@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent } from 'react'
+import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent } from 'react'
 import { BRAND_LOGOS } from './brand-logos.generated'
 import type { BrandLogoId } from './brand-logos.generated'
 import { CUSTOM_BRAND_IMAGES } from './custom-brand-images'
@@ -1592,7 +1592,9 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
   const [error, setError] = useState('')
   const [inviteOpen, setInviteOpen] = useState(false)
   const [inviteIds, setInviteIds] = useState<string[]>([])
+  const [workspaceWidth, setWorkspaceWidth] = useState(370)
   const stageRef = useRef<HTMLDivElement>(null)
+  const collabRef = useRef<HTMLDivElement>(null)
   const active = true
   const busyMeeting = BUSY_MEETINGS.has(meeting.status)
   const administrator = meeting.administratorProfile ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
@@ -1626,6 +1628,26 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
 
   const mention = (name: string, suffix = ''): void => setMessage(current => `${current}${current && !current.endsWith(' ') ? ' ' : ''}@${name} ${suffix}`)
 
+  const resizeWorkspace = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const layout = collabRef.current
+    if (!layout) return
+    event.preventDefault()
+    const bounds = layout.getBoundingClientRect()
+    const minWidth = 280
+    const maxWidth = Math.max(minWidth, Math.min(620, bounds.width - 320))
+    const move = (pointer: PointerEvent): void => {
+      setWorkspaceWidth(Math.round(Math.min(maxWidth, Math.max(minWidth, bounds.right - pointer.clientX))))
+    }
+    const stop = (): void => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+      document.body.classList.remove('arena-is-resizing')
+    }
+    document.body.classList.add('arena-is-resizing')
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop, { once: true })
+  }
+
   const inviteMembers = async (): Promise<void> => {
     if (!inviteIds.length) { setError('请至少选择一位要邀请的 AI 用户。'); return }
     if (await act({ action: 'invite-members', profileIds: inviteIds })) {
@@ -1658,7 +1680,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
         </aside>
       ) : null}
 
-        <div className="arena-collab-layout">
+      <div className="arena-collab-layout" ref={collabRef} style={{ '--arena-workspace-width': `${workspaceWidth}px` } as CSSProperties}>
         <div className="arena-stage" ref={stageRef}>
           {meeting.transcript.length === 0 ? <div className="arena-empty"><div><strong>{meeting.status === 'queued' ? '正在等候入群' : 'AI 成员正在准备发言'}</strong><WorkingDots /></div></div> : (
             <div className="arena-transcript">
@@ -1686,6 +1708,21 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
           {error ? <div className="arena-error">{error}</div> : null}
         </div>
 
+        <div
+          className="arena-workspace-resizer"
+          role="separator"
+          aria-label="调整右侧协作栏宽度"
+          aria-orientation="vertical"
+          aria-valuemin={280}
+          aria-valuemax={620}
+          aria-valuenow={workspaceWidth}
+          tabIndex={0}
+          onPointerDown={resizeWorkspace}
+          onKeyDown={event => {
+            if (event.key === 'ArrowLeft') setWorkspaceWidth(width => Math.min(620, width + 20))
+            else if (event.key === 'ArrowRight') setWorkspaceWidth(width => Math.max(280, width - 20))
+          }}
+        />
         <CollaborationConsole meeting={meeting} busy={busy} active={active} onAction={act} onCompose={setMessage} />
       </div>
 

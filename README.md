@@ -8,6 +8,12 @@
 
 <p align="center"><sub>直接选择已经配置好的 AI 用户，创建长期协作会议，而不是重复填写 provider 和 model。</sub></p>
 
+## v0.3.3 布局修复
+
+- 超长会议标题现在会在可用宽度内显示省略号，不会再把右侧协作栏或底部人类操作区挤出屏幕。
+- 桌面端右侧协作栏支持拖动调整宽度，窄屏自动采用上下布局。
+- 人类提示、点名栏、输入框和会议操作按钮始终保持在可视区域，长文字可以正常换行。
+
 ## v0.3.2 更新速览
 
 - **可自定义队列速率**：同渠道每分钟放行次数不再固定为 55，可在协作设置中填写 1–10000。
@@ -173,7 +179,7 @@ npm run build
 本仓库提交了预构建的 `lib/`，安装时不需要本机 TypeScript 工具链。推荐固定到正式版本：
 
 ```powershell
-<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.3.2"
+<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.3.3"
 ```
 
 如果希望直接跟随 `main` 分支的最新开发版本：
