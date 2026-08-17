@@ -906,7 +906,7 @@ function ProfilesView(props: {
              <label className="arena-field"><span>接话判断方式</span><select className="arena-select" value={preferences.autoReplyDecisionMode} onChange={event => setPreferences(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select></label>
              <details className="arena-setting-help arena-setting-help--admin"><summary>自动接话判断说明</summary><p><strong>单独判断：</strong>每个 AI 结合人格和上下文判断，更自然但增加模型请求与 Token。</p><p><strong>管理员决定：</strong>由管理员统一选择下一位接话，消耗更低但角色自主性略弱。</p><p>关闭某个 AI 的自动接话判断后，它仍能接话，但会等待管理员分配。</p></details>
              <label className="arena-toggle arena-toggle--admin"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
-             <label className="arena-toggle"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
+             
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>供应商 <b>必填</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
                 const provider = event.target.value
@@ -941,7 +941,7 @@ function ProfilesView(props: {
           <div className="arena-ai-form">
             <label className={`arena-field ${profileErrors.name ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.name)} value={draft.name} maxLength={24} placeholder="例如：毒舌产品经理" onChange={event => { setDraft(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, name: '' })); setMessage('') }} />{profileErrors.name ? <small className="arena-field-error">{profileErrors.name}</small> : null}</label>
             <label className="arena-field"><span>自定义人格 <em>选填，最多 16000 字</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder="可留空；支持导入含 {{user}}、{{char}} 的人格卡" onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
-            <label className="arena-toggle"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话判断</strong><small>仍会接话，但不自行判断；由管理员统一分配是否发言。</small></span></label>
+            <label className="arena-toggle arena-toggle--ai-reply"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话判断</strong><small>仍会接话，但不自行判断；由管理员统一分配是否发言。</small></span></label>
              <label className="arena-field"><span>预设快捷对话（每行一条，最多 8 条）</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={'帮我分析这个想法\n用你的风格吐槽一下\n给我三个行动建议'} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.provider ? 'has-error' : ''}`}>
@@ -1002,9 +1002,9 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
       <details className="arena-setting-help"><summary>为什么按供应商和模型计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，因此冷却和队列按“供应商 + 模型”这一层级共享。</p></details>
     </section>
     <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>说明</strong><span>自动接话设置位于用户中心的群管理员面板</span></div>
-      <label className="arena-toggle"><input type="checkbox" checked={settings.autoReplyEnabled} onChange={event => setSettings(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后完全停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
-      <label className="arena-field"><span>接话判断方式</span><select className="arena-select" value={settings.autoReplyDecisionMode} onChange={event => setSettings(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select></label>
-      <details className="arena-setting-help"><summary>查看两种方式的说明</summary><p><strong>单独判断：</strong>每个 AI 结合自己的人格和上下文判断是否接话，更自然，但每轮会增加模型请求与 Token 消耗。</p><p><strong>管理员决定：</strong>由管理员统一从候选角色中选择是否接话，消耗更低，但角色自主性略弱。</p></details>
+
+
+
     </section><button className="arena-launch" type="button" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '保存协作行为设置'}</button>
   </div></div>
 }
