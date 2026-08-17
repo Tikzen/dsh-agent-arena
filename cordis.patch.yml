@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-agent-arena
+      name: dsh-agent-arena
+      config:
+        stateDir: !!js dshHomePath('agent-arena')
+        maxConcurrentMeetings: 1
