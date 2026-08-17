@@ -976,7 +976,9 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
   const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true })
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
-  useEffect(() => { if (props.settings) setSettings(props.settings) }, [props.settings])
+  useEffect(() => {
+    if (props.settings) setSettings(props.settings)
+  }, [props.settings?.rateLimitCooldownEnabled, props.settings?.channelQueueEnabled, props.settings?.autoReplyEnabled])
   const save = async (): Promise<void> => {
     setSaving(true); setMessage('')
     try {
