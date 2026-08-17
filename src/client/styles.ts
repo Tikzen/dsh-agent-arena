@@ -307,7 +307,9 @@ export const ARENA_CSS = String.raw`
 .arena-profile-section__title span { color: var(--dsw-alias-label-caption, #777883); font-size: 10px; }
 .arena-human-editor { display: grid; grid-template-columns: minmax(220px, auto) minmax(180px, 1fr) auto; gap: 16px; align-items: end; }
 .arena-human-editor .arena-field { margin: 0; }
-.arena-admin-editor { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 18px; }
+.arena-admin-editor { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 18px; min-height: 470px; }
+ .arena-toggle--admin { margin: 20px 0 8px; padding: 11px 12px; border: 1px solid color-mix(in srgb, #7665e8 30%, var(--dsw-alias-border-l1, #ddd)); border-radius: 12px; background: rgba(118,101,232,.05); }
+ .arena-setting-help--admin { margin-top: 8px; }
 .arena-admin-editor .arena-model-picker { grid-template-columns: 1fr 1fr auto; }
 .arena-admin-save { min-height: 39px; white-space: nowrap; }
 .arena-avatar-editor { display: flex; align-items: center; align-content: flex-start; gap: 11px; flex-wrap: wrap; }
