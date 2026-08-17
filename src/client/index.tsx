@@ -53,6 +53,8 @@ interface Verdict {
   openItems?: string[]
 }
 
+type ArenaView = 'setup' | 'watch' | 'profiles' | 'settings' | 'create-chat' | 'chat' | 'history'
+
 type MeetingStage = 'discussion' | 'planning' | 'execution' | 'review' | 'waiting-human' | 'completed'
 type TaskStatus = 'todo' | 'in-progress' | 'review' | 'done' | 'blocked' | 'paused'
 
@@ -900,6 +902,7 @@ function ProfilesView(props: {
           <div className="arena-ai-form">
             <label className={`arena-field ${profileErrors.administratorName ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" value={administrator.name} maxLength={24} onChange={event => { setAdministrator(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, administratorName: '' })) }} /></label>
             <label className="arena-field"><span>管理员职责</span><textarea className="arena-textarea" value={administrator.role ?? ''} maxLength={16000} onChange={event => setAdministrator(current => ({ ...current, role: event.target.value }))} /></label>
+             <label className="arena-toggle"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>供应商 <b>必填</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
                 const provider = event.target.value
@@ -934,7 +937,7 @@ function ProfilesView(props: {
           <div className="arena-ai-form">
             <label className={`arena-field ${profileErrors.name ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.name)} value={draft.name} maxLength={24} placeholder="例如：毒舌产品经理" onChange={event => { setDraft(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, name: '' })); setMessage('') }} />{profileErrors.name ? <small className="arena-field-error">{profileErrors.name}</small> : null}</label>
             <label className="arena-field"><span>自定义人格 <em>选填，最多 16000 字</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder="可留空；支持导入含 {{user}}、{{char}} 的人格卡" onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
-            <label className="arena-toggle"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话</strong><small>仍会响应人类发言和明确的 @ 点名。</small></span></label>
+            <label className="arena-toggle"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话判断</strong><small>仍会接话，但不自行判断；由管理员统一分配是否发言。</small></span></label>
              <label className="arena-field"><span>预设快捷对话（每行一条，最多 8 条）</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={'帮我分析这个想法\n用你的风格吐槽一下\n给我三个行动建议'} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.provider ? 'has-error' : ''}`}>
@@ -966,13 +969,40 @@ function ProfilesView(props: {
         </div>
       </section>
       </div>
-      <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>协作行为设置</strong><span>限流保护与自动接话</span></div><label className="arena-toggle"><input type="checkbox" checked={preferences.rateLimitCooldownEnabled} onChange={event => setPreferences(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>共享供应商/API Key 触发限流后一起冷却，失败请求也计入。</small></span></label><label className="arena-toggle"><input type="checkbox" checked={preferences.channelQueueEnabled} onChange={event => setPreferences(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>降低 60 RPM 限流概率，但回复速度可能降低。</small></span></label><label className="arena-toggle"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话判断总开关</strong><small>关闭后不影响人类发言和 @AI。</small></span></label><label className="arena-field"><span>自动接话决策方式</span><select className="arena-select" value={preferences.autoReplyDecisionMode} onChange={event => setPreferences(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select><small className="arena-field-hint">单独判断更自然但增加请求与 Token；管理员决定消耗更低但自主性略弱。</small></label><button className="arena-control arena-control--primary" type="button" disabled={savingPreferences} onClick={() => void savePreferences()}>{savingPreferences ? '保存中…' : '保存协作行为设置'}</button></section>
+      <section className="arena-profile-section" hidden><div className="arena-profile-section__title"><strong>协作行为设置</strong><span>限流保护与自动接话</span></div><label className="arena-toggle"><input type="checkbox" checked={preferences.rateLimitCooldownEnabled} onChange={event => setPreferences(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>共享供应商/API Key 触发限流后一起冷却，失败请求也计入。</small></span></label><label className="arena-toggle"><input type="checkbox" checked={preferences.channelQueueEnabled} onChange={event => setPreferences(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>降低 60 RPM 限流概率，但回复速度可能降低。</small></span></label><label className="arena-toggle"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话判断总开关</strong><small>关闭后不影响人类发言和 @AI。</small></span></label><label className="arena-field"><span>自动接话决策方式</span><select className="arena-select" value={preferences.autoReplyDecisionMode} onChange={event => setPreferences(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select><small className="arena-field-hint">单独判断更自然但增加请求与 Token；管理员决定消耗更低但自主性略弱。</small></label><button className="arena-control arena-control--primary" type="button" disabled={savingPreferences} onClick={() => void savePreferences()}>{savingPreferences ? '保存中…' : '保存协作行为设置'}</button></section>
       <div className="arena-action-dock">
         <span className="arena-action-dock__message" data-error={Object.values(profileErrors).some(Boolean)}>{Object.values(profileErrors).some(Boolean) ? (profileErrors.form || message || '请补全标红的必填项。') : (message || (draft.id ? `正在编辑 ${draft.name || '这个 AI 用户'}。` : '名称、供应商和模型填写完整后即可创建；人格可以留空。'))}</span>
         <button className="arena-launch" type="button" disabled={savingAi} onClick={() => void saveAi()}>{savingAi ? '保存中…' : draft.id ? '保存 AI 用户修改' : '创建 AI 用户'}</button>
       </div>
     </div>
   )
+}
+
+function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (settings: ArenaSettings) => void }): ReactNode {
+  const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true, autoReplyDecisionMode: 'individual' })
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+  useEffect(() => { if (props.settings) setSettings(props.settings) }, [props.settings])
+  const save = async (): Promise<void> => {
+    setSaving(true); setMessage('')
+    try {
+      const result = await jsonRequest<{ settings: ArenaSettings }>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
+      setSettings(result.settings); props.onSaved(result.settings); setMessage('协作行为设置已保存。')
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : String(cause)) }
+    finally { setSaving(false) }
+  }
+  return <div className="arena-profiles"><div className="arena-page-scroll"><div className="arena-kicker">Collaboration behavior</div><h2>协作行为设置</h2><p className="arena-lead">统一配置共享渠道的保护策略，以及 AI 之间如何决定下一位发言者。</p>{message ? <div className="arena-page-alert is-success" role="status">{message}</div> : null}
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>渠道保护</strong><span>按供应商和模型共享计算</span></div>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.rateLimitCooldownEnabled} onChange={event => setSettings(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>同一供应商 + 模型的角色共享冷却状态；触发限流后所有共享角色一起等待，失败请求也会计入。</small></span></label>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商 + 模型的请求排队执行，有助于降低 60 RPM 触发概率，但回复速度可能降低。</small></span></label>
+      <details className="arena-setting-help"><summary>为什么按供应商和模型计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，因此冷却和队列按“供应商 + 模型”这一层级共享。</p></details>
+    </section>
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>自动接话判断</strong><span>管理员面板上的总开关</span></div>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.autoReplyEnabled} onChange={event => setSettings(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后完全停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
+      <label className="arena-field"><span>接话判断方式</span><select className="arena-select" value={settings.autoReplyDecisionMode} onChange={event => setSettings(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select></label>
+      <details className="arena-setting-help"><summary>查看两种方式的说明</summary><p><strong>单独判断：</strong>每个 AI 结合自己的人格和上下文判断是否接话，更自然，但每轮会增加模型请求与 Token 消耗。</p><p><strong>管理员决定：</strong>由管理员统一从候选角色中选择是否接话，消耗更低，但角色自主性略弱。</p></details>
+    </section><button className="arena-launch" type="button" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '保存协作行为设置'}</button>
+  </div></div>
 }
 
 function CreateChatView(props: {
@@ -1658,7 +1688,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null)
   const [chatType, setChatType] = useState<'direct' | 'group'>('direct')
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('meeting')
-  const [view, setView] = useState<'setup' | 'watch' | 'profiles' | 'create-chat' | 'chat' | 'history'>('setup')
+  const [view, setView] = useState<ArenaView>('setup')
   const [loadError, setLoadError] = useState('')
 
   const selected = useMemo(
@@ -1819,7 +1849,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     setView('create-chat')
   }
 
-  const activeMode: 'meeting' | 'direct' | 'group' | 'profiles' = view === 'profiles'
+  const activeMode: 'meeting' | 'direct' | 'group' | 'profiles' = view === 'profiles' || view === 'settings'
     ? 'profiles'
     : view === 'history'
       ? historyFilter
@@ -1875,6 +1905,9 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                 <button type="button" className={view !== 'history' && activeMode === 'profiles' ? 'is-active' : ''} onClick={() => switchMode('profiles')}>
                   <span>🪪</span><strong>用户中心</strong><small>头像、人格与模型</small>
                 </button>
+                <button type="button" className={view === 'settings' ? 'is-active' : ''} onClick={() => setView('settings')}>
+                  <span>⚙️</span><strong>协作设置</strong><small>限流与自动接话</small>
+                </button>
                 <button type="button" className={view === 'history' ? 'is-active' : ''} onClick={openHistory}>
                   <span>🗂️</span><strong>历史管理</strong><small>重命名与删除</small>
                 </button>
@@ -1922,7 +1955,9 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                     settings={state.settings}
                     onSettingsSaved={settings => setState(current => ({ ...current, settings }))}
                   />
-                ) : view === 'create-chat' ? (
+                ) : view === 'settings' ? (
+                   <CollaborationSettingsView settings={state.settings} onSaved={settings => setState(current => ({ ...current, settings }))} />
+                 ) : view === 'create-chat' ? (
                   <CreateChatView profiles={state.profiles} initialType={chatType} onManageProfiles={() => setView('profiles')} onCreated={roomCreated} />
                 ) : view === 'chat' && selectedRoom ? (
                   <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onInvite={inviteRoomMembers} onDelete={deleteRoom} />

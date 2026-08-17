@@ -649,7 +649,10 @@ export const ARENA_CSS = String.raw`
   .arena-template-grid { grid-template-columns: 1fr; }
   .arena-chat-user-grid { grid-template-columns: 1fr; }
   .arena-chat-head__actions .arena-control--danger { display: none; }
-  .arena-toggle { display: flex; align-items: flex-start; gap: 9px; margin: 10px 0; font-size: 11px; }
+  .arena-setting-help { margin: 12px 0 2px; padding: 9px 11px; border: 1px solid var(--dsw-alias-border-l1, #e1e1e7); border-radius: 10px; color: var(--dsw-alias-label-caption, #777883); font-size: 9px; }
+ .arena-setting-help summary { cursor: pointer; color: var(--dsw-alias-label-primary, #30303a); font-weight: 650; }
+ .arena-setting-help p { margin: 7px 0 0; line-height: 1.6; }
+ .arena-toggle { display: flex; align-items: flex-start; gap: 9px; margin: 10px 0; font-size: 11px; }
  .arena-toggle input { margin-top: 2px; accent-color: #7665e8; }
  .arena-toggle span { display: grid; gap: 3px; }
  .arena-toggle small, .arena-field-hint { color: var(--dsw-alias-label-caption, #777883); font-size: 9px; line-height: 1.5; }
