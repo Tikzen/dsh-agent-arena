@@ -307,7 +307,20 @@ export const ARENA_CSS = String.raw`
 .arena-profile-section__title span { color: var(--dsw-alias-label-caption, #777883); font-size: 10px; }
 .arena-human-editor { display: grid; grid-template-columns: minmax(220px, auto) minmax(180px, 1fr) auto; gap: 16px; align-items: end; }
 .arena-human-editor .arena-field { margin: 0; }
-.arena-admin-editor { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 18px; }
+.arena-admin-editor { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 18px; min-height: 560px; }
+ .arena-admin-editor .arena-ai-form { min-width: 0; overflow: visible; }
+ .arena-admin-editor .arena-field { margin-bottom: 14px; }
+.arena-setting-help { margin: 12px 0 2px; padding: 9px 11px; border: 1px solid var(--dsw-alias-border-l1, #e1e1e7); border-radius: 10px; color: var(--dsw-alias-label-caption, #777883); font-size: 9px; }
+.arena-setting-help summary { cursor: pointer; color: var(--dsw-alias-label-primary, #30303a); font-size: 10px; font-weight: 650; line-height: 1.45; }
+.arena-setting-help p { margin: 7px 0 0; line-height: 1.6; }
+.arena-toggle { box-sizing: border-box; display: flex; align-items: flex-start; gap: 9px; width: 100%; margin: 10px 0; font-size: 11px; line-height: 1.4; cursor: pointer; }
+.arena-toggle input { flex: none; width: 14px; height: 14px; margin: 1px 0 0; accent-color: #7665e8; }
+.arena-toggle > span { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.arena-toggle strong { font-size: 11px; font-weight: 680; line-height: 1.4; }
+.arena-toggle small, .arena-field-hint { color: var(--dsw-alias-label-caption, #777883); font-size: 9px; line-height: 1.5; }
+.arena-toggle--ai-reply { margin: 4px 0 12px; padding: 10px 12px; border: 1px solid color-mix(in srgb, #7665e8 30%, var(--dsw-alias-border-l1, #ddd)); border-radius: 12px; background: rgba(118,101,232,.05); }
+.arena-toggle--admin { margin: 14px 0 8px; padding: 10px 12px; border: 1px solid color-mix(in srgb, #7665e8 30%, var(--dsw-alias-border-l1, #ddd)); border-radius: 12px; background: rgba(118,101,232,.05); }
+.arena-setting-help--admin { margin-top: 8px; }
 .arena-admin-editor .arena-model-picker { grid-template-columns: 1fr 1fr auto; }
 .arena-admin-save { min-height: 39px; white-space: nowrap; }
 .arena-avatar-editor { display: flex; align-items: center; align-content: flex-start; gap: 11px; flex-wrap: wrap; }
@@ -649,7 +662,7 @@ export const ARENA_CSS = String.raw`
   .arena-template-grid { grid-template-columns: 1fr; }
   .arena-chat-user-grid { grid-template-columns: 1fr; }
   .arena-chat-head__actions .arena-control--danger { display: none; }
-  .arena-chat-settings { top: 58px; right: 8px; width: calc(100% - 16px); max-height: calc(100% - 68px); }
+ .arena-chat-settings { top: 58px; right: 8px; width: calc(100% - 16px); max-height: calc(100% - 68px); }
   .arena-invite-list { grid-template-columns: 1fr; }
   .arena-setup-row { grid-template-columns: 1fr; }
   .arena-selected-grid { grid-template-columns: 1fr; }

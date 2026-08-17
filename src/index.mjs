@@ -35,6 +35,20 @@ class HttpError extends Error {
 
 const nowIso = () => new Date().toISOString()
 const safeError = error => error instanceof Error ? error.message : String(error)
+const COOLDOWN_MS = 60_000
+const CHANNEL_WINDOW_MS = 60_000
+const CHANNEL_REQUEST_LIMIT = 55
+const RATE_LIMIT_RE = /(?:429|rate.?limit|too many requests|频率|限流|请求过于频繁)/i
+
+export function arenaChannelKey(selection) {
+  return String(selection?.provider || 'default')
+}
+
+export function isArenaRateLimitFailure(value) {
+  const failure = value?.failure && typeof value.failure === 'object' ? value.failure : value
+  return Number(failure?.status) === 429
+    || RATE_LIMIT_RE.test(`${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`)
+}
 
 function createArenaUserMessage(text) {
   return Object.freeze({
@@ -47,10 +61,15 @@ function createArenaUserMessage(text) {
 
 // DSH's model selection is Agent-scoped. Keeping this tiny adapter local avoids
 // forcing linked plugins to install a second copy of DSH's runtime packages.
-function installArenaModelSelection(agentCtx, selection) {
-  const state = { current: selection, assembled: undefined }
+// `selectionOrProvider` may be a plain selection object or a function returning
+// the current selection; a function is re-evaluated on every request so that
+// live profile edits (e.g. changing a role's API provider/model mid-meeting)
+// take effect on already-created sessions without rebuilding their agents.
+export function installArenaModelSelection(agentCtx, selectionOrProvider) {
+  const resolveSelection = () => typeof selectionOrProvider === 'function' ? selectionOrProvider() : selectionOrProvider
+  const state = { assembled: undefined }
   const disposeAssembly = agentCtx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-    const selected = state.current
+    const selected = resolveSelection()
     const assembled = await next()
     state.assembled = selected
     return {
@@ -251,6 +270,11 @@ export function apply(ctx, config = {}) {
   const rooms = new Map()
   const profiles = {
     human: { id: 'human', name: '你', avatar: '🧑' },
+    settings: {
+      rateLimitCooldownEnabled: false,
+      channelQueueEnabled: false,
+      autoReplyEnabled: true,
+    },
     administrator: {
       id: 'administrator',
       name: '管理员',
@@ -265,6 +289,10 @@ export function apply(ctx, config = {}) {
   const runtimes = new Map()
   const pendingMeetingStarts = new Map()
   const roomRuntimes = new Map()
+  const channelQueues = new Map()
+  const channelCooldowns = new Map()
+  const channelRequestTimes = new Map()
+  const arenaSessionIds = new Set()
   let activeCount = 0
   let disposed = false
   let persistChain = Promise.resolve()
@@ -785,7 +813,7 @@ export function apply(ctx, config = {}) {
   }
 
   const persist = () => {
-    const payload = JSON.stringify({ version: 3, meetings: [...meetings.values()], rooms: [...rooms.values()], profiles, migrations }, null, 2)
+    const payload = JSON.stringify({ version: 4, meetings: [...meetings.values()], rooms: [...rooms.values()], profiles, migrations }, null, 2)
     persistChain = persistChain.catch(() => undefined).then(async () => {
       await mkdir(stateDir, { recursive: true })
       await writeFile(stateFile, `${payload}\n`, 'utf8')
@@ -852,8 +880,14 @@ export function apply(ctx, config = {}) {
           avatar: cleanAvatar(stored.profiles.human.avatar, '🧑'),
         }
       }
+      if (stored?.profiles?.settings) profiles.settings = {
+        ...profiles.settings,
+        rateLimitCooldownEnabled: stored.profiles.settings.rateLimitCooldownEnabled === true,
+        channelQueueEnabled: stored.profiles.settings.channelQueueEnabled === true,
+        autoReplyEnabled: stored.profiles.settings.autoReplyEnabled !== false,
+      }
       if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator' }
-      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model)
+      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model).map(item => ({ ...item, autoReplyDisabled: item.autoReplyDisabled === true }))
       for (const room of Array.isArray(stored?.rooms) ? stored.rooms : []) {
         if (!room?.id) continue
         if (room.type === 'group' && !room.administratorProfile) {
@@ -957,8 +991,31 @@ export function apply(ctx, config = {}) {
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       updatedAt: nowIso(),
     }
+    for (const meeting of meetings.values()) {
+      meeting.administratorProfile = { ...administratorSnapshot() }
+      ensureActivityMonitor(meeting)
+      meeting.updatedAt = nowIso()
+    }
+    for (const room of rooms.values()) {
+      if (!room.administratorProfile) continue
+      room.administratorProfile = { ...administratorSnapshot() }
+      ensureActivityMonitor(room)
+      room.updatedAt = nowIso()
+    }
     await persist()
     return profiles.administrator
+  }
+
+  async function saveSettings(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '设置必须是 JSON 对象')
+    profiles.settings = {
+      ...profiles.settings,
+      rateLimitCooldownEnabled: raw.rateLimitCooldownEnabled === true,
+      channelQueueEnabled: raw.channelQueueEnabled === true,
+      autoReplyEnabled: raw.autoReplyEnabled !== false,
+    }
+    await persist()
+    return profiles.settings
   }
 
   async function saveAiProfile(raw) {
@@ -972,6 +1029,7 @@ export function apply(ctx, config = {}) {
       ...model,
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       presetPrompts: (Array.isArray(raw.presetPrompts) ? raw.presetPrompts : []).map(item => typeof item === 'string' ? item.trim().slice(0, 240) : '').filter(Boolean).slice(0, 8),
+      autoReplyDisabled: raw.autoReplyDisabled === true,
       color: /^#[0-9a-f]{6}$/i.test(String(raw.color ?? '')) ? String(raw.color) : '#6f5ee8',
       updatedAt: nowIso(),
     }
@@ -983,6 +1041,15 @@ export function apply(ctx, config = {}) {
       room.participants.splice(participantIndex, 1, { ...profile })
       ensureActivityMonitor(room)
       room.updatedAt = nowIso()
+    }
+    for (const meeting of meetings.values()) {
+      const participantIndex = meeting.participants.findIndex(item => item.id === profile.id)
+      if (participantIndex < 0) continue
+      const previous = meeting.participants[participantIndex]
+      // 保留运行期字段（status 等），只刷新资料与 API 来源，避免打断正在进行的轮次。
+      meeting.participants.splice(participantIndex, 1, { ...profile, status: previous.status })
+      ensureActivityMonitor(meeting)
+      meeting.updatedAt = nowIso()
     }
     await persist()
     return profile
@@ -1011,11 +1078,23 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // 返回角色“当前最新”的模型选择：优先取全局配置（profiles.aiUsers / profiles.administrator），
+  // 这样在会议或群聊进行中修改角色的 API 来源后，已创建会话中的长驻角色 Agent
+  // 也会在下一轮请求里自动使用新的 provider / model。
+  function liveModelSelection(profile) {
+    const latest = profile?.id === 'administrator'
+      ? profiles.administrator
+      : profiles.aiUsers.find(item => item.id === profile?.id) || profile
+    return modelSelection(latest)
+  }
+
   async function createParent(label, signal) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection()
+    const sessionId = randomUUID()
+    arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
-      sessionId: randomUUID(),
+      sessionId,
       meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal,
@@ -1027,6 +1106,128 @@ export function apply(ctx, config = {}) {
     })
     return archiveArenaAgent(handle)
   }
+
+  function cooldownInfo(selection) {
+    const key = arenaChannelKey(selection)
+    const until = channelCooldowns.get(key) || 0
+    if (until <= Date.now()) {
+      channelCooldowns.delete(key)
+      return null
+    }
+    return { key, until, remainingMs: until - Date.now() }
+  }
+
+  function markChannelFailure(selection, error) {
+    if (!profiles.settings.rateLimitCooldownEnabled) return
+    if (!isArenaRateLimitFailure(error)) return
+    const retryAfterMs = Number(error?.providerRetryAfterMs ?? error?.failure?.providerRetryAfterMs)
+    const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? Math.max(COOLDOWN_MS, retryAfterMs) : COOLDOWN_MS
+    channelCooldowns.set(arenaChannelKey(selection), Date.now() + delayMs)
+  }
+
+  function waitForChannel(ms, signal) {
+    if (!(ms > 0)) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(done, ms)
+      const abort = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
+        reject(signal?.reason instanceof Error ? signal.reason : new Error('任务已终止'))
+      }
+      function done() {
+        signal?.removeEventListener('abort', abort)
+        resolve()
+      }
+      if (signal?.aborted) abort()
+      else signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  async function waitForChannelCooldown(selection, signal) {
+    while (profiles.settings.rateLimitCooldownEnabled) {
+      const cooldown = cooldownInfo(selection)
+      if (!cooldown) return
+      await waitForChannel(cooldown.remainingMs, signal)
+    }
+  }
+
+  async function acquireChannel(selection, signal) {
+    if (!profiles.settings.channelQueueEnabled) return () => undefined
+    const key = arenaChannelKey(selection)
+    const previous = channelQueues.get(key) || Promise.resolve()
+    let unlock
+    const gate = new Promise(resolve => { unlock = resolve })
+    channelQueues.set(key, gate)
+    await previous.catch(() => undefined)
+    if (signal?.aborted) {
+      unlock()
+      if (channelQueues.get(key) === gate) channelQueues.delete(key)
+      throw signal.reason instanceof Error ? signal.reason : new Error('任务已终止')
+    }
+    return () => {
+      unlock()
+      if (channelQueues.get(key) === gate) channelQueues.delete(key)
+    }
+  }
+
+  async function reserveChannelRequest(selection, signal) {
+    if (!profiles.settings.channelQueueEnabled) return
+    const key = arenaChannelKey(selection)
+    while (true) {
+      const now = Date.now()
+      const recent = (channelRequestTimes.get(key) || []).filter(timestamp => timestamp > now - CHANNEL_WINDOW_MS)
+      if (recent.length < CHANNEL_REQUEST_LIMIT) {
+        recent.push(now)
+        channelRequestTimes.set(key, recent)
+        return
+      }
+      channelRequestTimes.set(key, recent)
+      await waitForChannel(Math.max(1, recent[0] + CHANNEL_WINDOW_MS - now), signal)
+    }
+  }
+
+  function guardedArenaStream(options, next) {
+    const selection = { provider: options.provider, model: options.model }
+    return (async function* () {
+      await waitForChannelCooldown(selection, options.signal)
+      const release = await acquireChannel(selection, options.signal)
+      try {
+        await waitForChannelCooldown(selection, options.signal)
+        await reserveChannelRequest(selection, options.signal)
+        for await (const chunk of next()) {
+          if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') markChannelFailure(selection, chunk.reason.failure)
+          yield chunk
+        }
+      } catch (error) {
+        markChannelFailure(selection, error)
+        throw error
+      } finally {
+        release()
+      }
+    })()
+  }
+
+  ctx.effect(() => {
+    const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
+      const header = agent?.session?.header || {}
+      const sessionId = String(agent?.id || header.id || '')
+      const parentSessionId = String(header.parentSession || '')
+      if (arenaSessionIds.has(sessionId) || arenaSessionIds.has(parentSessionId)) arenaSessionIds.add(sessionId)
+      return next()
+    })
+    const disposeStream = ctx.on('llm/stream', (options, next) => {
+      if (!arenaSessionIds.has(String(options.sessionId || ''))) return next()
+      return guardedArenaStream(options, next)
+    })
+    return () => {
+      disposeRequest()
+      disposeStream()
+      channelQueues.clear()
+      channelCooldowns.clear()
+      channelRequestTimes.clear()
+      arenaSessionIds.clear()
+    }
+  }, 'agent-arena: shared provider queue and cooldown')
 
   async function startRoleRun({ label, prompt, persona, profile, parent, runtime, outputSchema }) {
     const selection = modelSelection(profile)
@@ -1066,13 +1267,15 @@ export function apply(ctx, config = {}) {
   async function createFullRoleAgent({ label, profile, runtime }) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection(profile)
+    const sessionId = randomUUID()
+    arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
-      sessionId: randomUUID(),
+      sessionId,
       meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal: runtime.abort.signal,
       async setup(agentCtx) {
-        installArenaModelSelection(agentCtx, selection)
+        installArenaModelSelection(agentCtx, () => liveModelSelection(profile))
         agentCtx.systemPrompt.section({
           name: 'agent-arena:identity',
           order: -20,
@@ -1413,8 +1616,10 @@ export function apply(ctx, config = {}) {
     const records = isMeeting ? container.transcript : container.messages
     const focus = latestHumanRequest(container, isMeeting)
     const completedNames = completedIds.map(id => container.participants.find(item => item.id === id)?.name).filter(Boolean).join('、')
+    if (!profiles.settings.autoReplyEnabled) return []
     const available = container.participants.filter(item => !isMuted(container, item.id))
     return Promise.all(available.map(async profile => {
+      if (profile.autoReplyDisabled) return { profile, shouldSpeak: true, reason: '此角色已关闭独立判断，请管理员直接判断它是否适合接话。' }
       setRoleActivity(container, profile, { status: 'thinking', stage: '正在判断是否需要接话', detail: '', currentTool: '' })
       try {
         const result = await startRoleRun({
@@ -1458,10 +1663,10 @@ export function apply(ctx, config = {}) {
       const result = await startRoleRun({
         label: `arena:${container.id}:continuation-guard`,
         prompt: [
-          `你是群管理员 ${admin.name}。角色已经各自判断是否接话，你只负责防止跑题、重复和刷屏，不替他们决定观点。`,
+          `你是群管理员 ${admin.name}。通常角色会先判断是否接话；关闭独立判断的角色则由你直接判断。你负责选择下一位发言者，并防止跑题、重复和刷屏。`,
           `人类当前讨论焦点：${focus}`,
           ...(isMeeting ? [`会议主题：${container.topic}`] : [`群聊名称：${container.name}`]),
-          '候选角色及其内部理由：',
+          '候选角色及其判断或分配说明：',
           intents.map(item => `- ${item.profile.name} (${item.profile.id})：${item.reason || '未说明'}`).join('\n'),
           '如果候选发言会明显偏离人类最近的焦点，onTopic=false、complete=true、approvedSpeakerIds=[]，停止本次自动接话并等待人类。相关子问题、必要的澄清和任务执行不算跑题。',
           '如果只是重复、附和、抢话或没有实际推进，也应 complete=true。否则 onTopic=true、complete=false，并且只批准最适合接下一句话的 1 位。这样该角色发言后，所有角色会基于这条新消息再次独立判断。',
@@ -1493,6 +1698,7 @@ export function apply(ctx, config = {}) {
     const admin = meeting.administratorProfile
     setRoleActivity(meeting, admin, { status: 'working', stage: '等待各角色判断是否接话', detail: '', currentTool: '' }, '启动逐角色接话判断')
     try {
+      if (!profiles.settings.autoReplyEnabled) return
       const intents = (await collectReplyIntents(meeting, completedIds, runtime, true, requirePeerReaction)).filter(item => item.shouldSpeak)
       const decision = await guardContinuation(meeting, intents, runtime, true)
       if (decision.complete || !decision.onTopic) {
@@ -1897,6 +2103,7 @@ export function apply(ctx, config = {}) {
     const admin = room.administratorProfile
     setRoleActivity(room, admin, { status: 'working', stage: '等待各角色判断是否接话', detail: '', currentTool: '' }, '启动逐角色接话判断')
     try {
+      if (!profiles.settings.autoReplyEnabled) return
       const intents = (await collectReplyIntents(room, completedIds, runtime, false, requirePeerReaction)).filter(item => item.shouldSpeak)
       const decision = await guardContinuation(room, intents, runtime, false)
       if (decision.complete || !decision.onTopic) {
@@ -2095,9 +2302,14 @@ export function apply(ctx, config = {}) {
             rooms: [...rooms.values()].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).map(publicMeeting),
             templates: ARENA_TEMPLATES,
             profiles: publicMeeting({ ...profiles, administrator: administratorSnapshot() }),
+            settings: publicMeeting(profiles.settings),
+            cooldowns: [...channelCooldowns.entries()].filter(([, until]) => until > Date.now()).map(([key, until]) => ({ key, until, remainingMs: until - Date.now() })),
             modelCatalog: await modelCatalog(), defaultModel: defaultModel(), limits: { maxConcurrentMeetings },
           })
           return
+        }
+        if (method === 'PATCH' && suffix === '/settings') {
+          respond(res, 200, { settings: publicMeeting(await saveSettings(await readJsonBody(req))) }); return
         }
         if (method === 'POST' && suffix === '/profiles/human') {
           respond(res, 200, { profile: publicMeeting(await saveHumanProfile(await readJsonBody(req))) }); return

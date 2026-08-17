@@ -53,6 +53,8 @@ interface Verdict {
   openItems?: string[]
 }
 
+type ArenaView = 'setup' | 'watch' | 'profiles' | 'settings' | 'create-chat' | 'chat' | 'history'
+
 type MeetingStage = 'discussion' | 'planning' | 'execution' | 'review' | 'waiting-human' | 'completed'
 type TaskStatus = 'todo' | 'in-progress' | 'review' | 'done' | 'blocked' | 'paused'
 
@@ -133,6 +135,12 @@ interface Meeting {
   artifacts?: MeetingArtifact[]
 }
 
+interface ArenaSettings {
+  rateLimitCooldownEnabled: boolean
+  channelQueueEnabled: boolean
+  autoReplyEnabled: boolean
+}
+
 interface UserProfile {
   id: string
   name: string
@@ -142,6 +150,7 @@ interface UserProfile {
   model?: string
   color?: string
   presetPrompts?: string[]
+  autoReplyDisabled?: boolean
 }
 
 interface ChatMessage {
@@ -214,6 +223,8 @@ interface ArenaState {
   defaultModel?: { provider: string; model: string }
   profiles?: { human: UserProfile; administrator: UserProfile; aiUsers: UserProfile[] }
   modelCatalog?: ModelCatalogEntry[]
+  settings?: ArenaSettings
+  cooldowns?: Array<{ key: string; until: number; remainingMs: number }>
 }
 
 const FALLBACK_TEMPLATES: Template[] = [
@@ -723,8 +734,10 @@ function ProfilesView(props: {
   onAdministratorSaved: (profile: UserProfile) => void
   onAiSaved: (profile: UserProfile) => void
   onAiDeleted: (id: string) => void
+  settings?: ArenaSettings
+  onSettingsSaved: (settings: ArenaSettings) => void
 }): ReactNode {
-  const { profiles, modelCatalog, defaultModel, onHumanSaved, onAdministratorSaved, onAiSaved, onAiDeleted } = props
+  const { profiles, modelCatalog, defaultModel, onHumanSaved, onAdministratorSaved, onAiSaved, onAiDeleted, settings, onSettingsSaved } = props
   const initialProvider = defaultModel?.provider || modelCatalog[0]?.id || ''
   const initialModels = modelCatalog.find(item => item.id === initialProvider)?.models ?? []
   const [human, setHuman] = useState<UserProfile>(profiles?.human ?? { id: 'human', name: '你', avatar: '🧑' })
@@ -742,6 +755,7 @@ function ProfilesView(props: {
   const [savingAi, setSavingAi] = useState(false)
   const [message, setMessage] = useState('')
   const [profileErrors, setProfileErrors] = useState<Record<string, string>>({})
+  const [preferences, setPreferences] = useState<ArenaSettings>(settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true })
 
   useEffect(() => {
     if (profiles?.human) setHuman(profiles.human)
@@ -750,6 +764,10 @@ function ProfilesView(props: {
   useEffect(() => {
     if (profiles?.administrator) setAdministrator(profiles.administrator)
   }, [profiles?.administrator?.name, profiles?.administrator?.avatar, profiles?.administrator?.provider, profiles?.administrator?.model])
+
+  useEffect(() => {
+    if (settings) setPreferences(settings)
+  }, [settings?.rateLimitCooldownEnabled, settings?.channelQueueEnabled, settings?.autoReplyEnabled])
 
   useEffect(() => {
     if (draft.provider || modelCatalog.length === 0) return
@@ -804,7 +822,10 @@ function ProfilesView(props: {
     setMessage('')
     try {
       const result = await jsonRequest<{ profile: UserProfile }>('/profiles/administrator', { method: 'POST', body: JSON.stringify(administrator) })
+      const settingsResult = await jsonRequest<{ settings: ArenaSettings }>('/settings', { method: 'PATCH', body: JSON.stringify(preferences) })
       setAdministrator(result.profile)
+      setPreferences(settingsResult.settings)
+      onSettingsSaved(settingsResult.settings)
       onAdministratorSaved(result.profile)
       setProfileErrors(current => ({ ...current, administratorName: '', administratorProvider: '', administratorModel: '', form: '' }))
       setMessage('管理员资料已保存，新建会议和群聊会自动加入它。')
@@ -875,6 +896,8 @@ function ProfilesView(props: {
           <div className="arena-ai-form">
             <label className={`arena-field ${profileErrors.administratorName ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" value={administrator.name} maxLength={24} onChange={event => { setAdministrator(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, administratorName: '' })) }} /></label>
             <label className="arena-field"><span>管理员职责</span><textarea className="arena-textarea" value={administrator.role ?? ''} maxLength={16000} onChange={event => setAdministrator(current => ({ ...current, role: event.target.value }))} /></label>
+            <label className="arena-toggle arena-toggle--admin"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>开启后沿用旧版分配模式：AI 先判断是否接话，再由管理员选择下一位发言者。<br />关闭后停止 AI 之间的自动接话，但不影响人类发言和明确 @AI。</small></span></label>
+
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>供应商 <b>必填</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
                 const provider = event.target.value
@@ -909,7 +932,8 @@ function ProfilesView(props: {
           <div className="arena-ai-form">
             <label className={`arena-field ${profileErrors.name ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.name)} value={draft.name} maxLength={24} placeholder="例如：毒舌产品经理" onChange={event => { setDraft(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, name: '' })); setMessage('') }} />{profileErrors.name ? <small className="arena-field-error">{profileErrors.name}</small> : null}</label>
             <label className="arena-field"><span>自定义人格 <em>选填，最多 16000 字</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder="可留空；支持导入含 {{user}}、{{char}} 的人格卡" onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
-            <label className="arena-field"><span>预设快捷对话（每行一条，最多 8 条）</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={'帮我分析这个想法\n用你的风格吐槽一下\n给我三个行动建议'} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
+             <label className="arena-field"><span>预设快捷对话（每行一条，最多 8 条）</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={'帮我分析这个想法\n用你的风格吐槽一下\n给我三个行动建议'} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
+            <label className="arena-toggle arena-toggle--ai-reply"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话判断</strong><small>仍可自动接话，但不再自行判断是否接话，改由管理员统一分配。<br />关闭此功能可节省 Token。</small></span></label>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.provider ? 'has-error' : ''}`}>
                 <span>供应商 <b>必填</b></span>
@@ -946,6 +970,33 @@ function ProfilesView(props: {
       </div>
     </div>
   )
+}
+
+function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (settings: ArenaSettings) => void }): ReactNode {
+  const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { rateLimitCooldownEnabled: false, channelQueueEnabled: false, autoReplyEnabled: true })
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+  useEffect(() => { if (props.settings) setSettings(props.settings) }, [props.settings])
+  const save = async (): Promise<void> => {
+    setSaving(true); setMessage('')
+    try {
+      const result = await jsonRequest<{ settings: ArenaSettings }>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
+      setSettings(result.settings); props.onSaved(result.settings); setMessage('协作行为设置已保存。')
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : String(cause)) }
+    finally { setSaving(false) }
+  }
+  return <div className="arena-profiles"><div className="arena-page-scroll"><div className="arena-kicker">Collaboration behavior</div><h2>协作行为设置</h2><p className="arena-lead">统一配置 Arena 中所有模型请求的共享渠道保护策略。</p>{message ? <div className="arena-page-alert is-success" role="status">{message}</div> : null}
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>渠道保护</strong><span>按供应商配置共享计算</span></div>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.rateLimitCooldownEnabled} onChange={event => setSettings(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>同一供应商配置触发限流后，所有共享角色一起等待；失败请求也计入渠道次数。</small></span></label>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商下的正式发言、工具续跑、子 Agent 和接话判断统一排队，并按每分钟 55 次的安全额度放行；回复速度可能降低。</small></span></label>
+      <details className="arena-setting-help"><summary>为什么按供应商配置计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，无法按密钥精确分组，因此将同一供应商配置下的不同模型视为共享渠道。</p></details>
+    </section>
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>说明</strong><span>自动接话设置位于用户中心的群管理员面板</span></div>
+
+
+
+    </section><button className="arena-launch" type="button" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '保存协作行为设置'}</button>
+  </div></div>
 }
 
 function CreateChatView(props: {
@@ -1631,7 +1682,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null)
   const [chatType, setChatType] = useState<'direct' | 'group'>('direct')
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('meeting')
-  const [view, setView] = useState<'setup' | 'watch' | 'profiles' | 'create-chat' | 'chat' | 'history'>('setup')
+  const [view, setView] = useState<ArenaView>('setup')
   const [loadError, setLoadError] = useState('')
 
   const selected = useMemo(
@@ -1792,7 +1843,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     setView('create-chat')
   }
 
-  const activeMode: 'meeting' | 'direct' | 'group' | 'profiles' = view === 'profiles'
+  const activeMode: 'meeting' | 'direct' | 'group' | 'profiles' = view === 'profiles' || view === 'settings'
     ? 'profiles'
     : view === 'history'
       ? historyFilter
@@ -1848,6 +1899,9 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                 <button type="button" className={view !== 'history' && activeMode === 'profiles' ? 'is-active' : ''} onClick={() => switchMode('profiles')}>
                   <span>🪪</span><strong>用户中心</strong><small>头像、人格与模型</small>
                 </button>
+                <button type="button" className={view === 'settings' ? 'is-active' : ''} onClick={() => setView('settings')}>
+                  <span>⚙️</span><strong>协作设置</strong><small>限流与自动接话</small>
+                </button>
                 <button type="button" className={view === 'history' ? 'is-active' : ''} onClick={openHistory}>
                   <span>🗂️</span><strong>历史管理</strong><small>重命名与删除</small>
                 </button>
@@ -1892,8 +1946,12 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                     onAdministratorSaved={administratorSaved}
                     onAiSaved={aiSaved}
                     onAiDeleted={aiDeleted}
+                    settings={state.settings}
+                    onSettingsSaved={settings => setState(current => ({ ...current, settings }))}
                   />
-                ) : view === 'create-chat' ? (
+                ) : view === 'settings' ? (
+                   <CollaborationSettingsView settings={state.settings} onSaved={settings => setState(current => ({ ...current, settings }))} />
+                 ) : view === 'create-chat' ? (
                   <CreateChatView profiles={state.profiles} initialType={chatType} onManageProfiles={() => setView('profiles')} onCreated={roomCreated} />
                 ) : view === 'chat' && selectedRoom ? (
                   <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onInvite={inviteRoomMembers} onDelete={deleteRoom} />
