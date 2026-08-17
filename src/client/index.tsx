@@ -821,6 +821,7 @@ function ProfilesView(props: {
     try {
       const result = await jsonRequest<{ profile: UserProfile }>('/profiles/administrator', { method: 'POST', body: JSON.stringify(administrator) })
       setAdministrator(result.profile)
+       void jsonRequest<{ settings: ArenaSettings }>('/settings', { method: 'PATCH', body: JSON.stringify(preferences) }).then(result => { setPreferences(result.settings); onSettingsSaved(result.settings) })
       onAdministratorSaved(result.profile)
       setProfileErrors(current => ({ ...current, administratorName: '', administratorProvider: '', administratorModel: '', form: '' }))
       setMessage('管理员资料已保存，新建会议和群聊会自动加入它。')
@@ -1000,7 +1001,7 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
       <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商 + 模型的请求排队执行，有助于降低 60 RPM 触发概率，但回复速度可能降低。</small></span></label>
       <details className="arena-setting-help"><summary>为什么按供应商和模型计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，因此冷却和队列按“供应商 + 模型”这一层级共享。</p></details>
     </section>
-    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>自动接话判断（已移至管理员面板）</strong><span>请在群管理员设置中统一管理</span></div>
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>说明</strong><span>自动接话设置位于用户中心的群管理员面板</span></div>
       <label className="arena-toggle"><input type="checkbox" checked={settings.autoReplyEnabled} onChange={event => setSettings(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>关闭后完全停止 AI 之间的自动接话判断，但不影响人类发言和明确 @AI。</small></span></label>
       <label className="arena-field"><span>接话判断方式</span><select className="arena-select" value={settings.autoReplyDecisionMode} onChange={event => setSettings(current => ({ ...current, autoReplyDecisionMode: event.target.value as ArenaSettings['autoReplyDecisionMode'] }))}><option value="individual">单独判断</option><option value="admin">管理员决定</option></select></label>
       <details className="arena-setting-help"><summary>查看两种方式的说明</summary><p><strong>单独判断：</strong>每个 AI 结合自己的人格和上下文判断是否接话，更自然，但每轮会增加模型请求与 Token 消耗。</p><p><strong>管理员决定：</strong>由管理员统一从候选角色中选择是否接话，消耗更低，但角色自主性略弱。</p></details>
