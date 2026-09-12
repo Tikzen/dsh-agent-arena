@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { statSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
 import {
   API_ROOT,
   ARENA_TEMPLATES,
@@ -953,6 +954,7 @@ export function apply(ctx, config = {}) {
         }
         room.mutedParticipantIds = Array.isArray(room.mutedParticipantIds) ? room.mutedParticipantIds : []
         room.permissions = room.permissions && typeof room.permissions === 'object' ? room.permissions : {}
+        room.workdir = typeof room.workdir === 'string' ? room.workdir.trim() : ''
         for (const participant of permissionProfiles(room)) room.permissions[participant.id] = normalizePermissionMode(room.permissions[participant.id])
         for (const message of room.messages ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         room.respondingProfileIds = Array.isArray(room.respondingProfileIds) ? room.respondingProfileIds : []
@@ -1235,14 +1237,14 @@ export function apply(ctx, config = {}) {
     return container
   }
 
-  async function createParent(label, signal) {
+  async function createParent(label, signal, container) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection()
     const sessionId = randomUUID()
     arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
       sessionId,
-      meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
+      meta: { cwd: container?.workdir || process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal,
       async setup(agentCtx) {
@@ -1444,7 +1446,7 @@ export function apply(ctx, config = {}) {
     arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
       sessionId,
-      meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
+      meta: { cwd: runtime.container?.workdir || process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal: runtime.abort.signal,
       async setup(agentCtx) {
@@ -1985,7 +1987,7 @@ export function apply(ctx, config = {}) {
     meeting.updatedAt = nowIso()
     await persist()
     try {
-      runtime.parent = await createParent('Agent Arena collaborative meeting', runtime.abort.signal)
+      runtime.parent = await createParent('Agent Arena collaborative meeting', runtime.abort.signal, meeting)
       while (!runtime.abort.signal.aborted) {
         if (!await checkpoint(meeting, runtime)) break
         while (runtime.adminCommands.length) {
@@ -2368,7 +2370,7 @@ export function apply(ctx, config = {}) {
     room.updatedAt = nowIso()
     await persist()
     try {
-      runtime.parent = await createParent('Agent Arena social chat', runtime.abort.signal)
+      runtime.parent = await createParent('Agent Arena social chat', runtime.abort.signal, room)
       while (!runtime.abort.signal.aborted) {
         while (runtime.adminCommands.length) await runRoomAdmin(room, runtime.adminCommands.shift(), runtime)
         const ids = [...runtime.targetIds].filter(id => !isMuted(room, id))
@@ -2435,6 +2437,25 @@ export function apply(ctx, config = {}) {
     if (!runtime.running) void runRoomReplies(room, runtime)
   }
 
+  /**
+ * 群/私聊/会议的工作区目录：留空 = 跟随 dsh web 进程启动目录（历史行为）；
+ * 指定时必须是非空的绝对路径且已存在，否则拒绝写入。
+ */
+function normalizeRoomWorkdir(value) {
+  const text = String(value ?? '').trim()
+  if (!text) return ''
+  if (!isAbsolute(text)) throw new HttpError(400, '工作区必须是绝对路径，例如 D:\mine\项目名')
+  const absolute = resolve(text)
+  let stat
+  try {
+    stat = statSync(absolute)
+  } catch {
+    throw new HttpError(400, `工作区目录不存在：${absolute}`)
+  }
+  if (!stat.isDirectory()) throw new HttpError(400, `工作区不是目录：${absolute}`)
+  return absolute
+}
+
   async function createRoom(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '聊天配置必须是 JSON 对象')
     const type = raw.type === 'group' ? 'group' : 'direct'
@@ -2451,7 +2472,7 @@ export function apply(ctx, config = {}) {
       name: nameInput || (type === 'direct' ? participants[0].name : `${participants.map(item => item.name).join('、')}的小群`),
       participants: participants.map(item => ({ ...item })), humanProfile: { ...profiles.human },
       administratorProfile: type === 'group' ? administratorSnapshot() : null,
-      messages: [], mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
+      messages: [], workdir: '', mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
     }
     ensureActivityMonitor(room)
     rooms.set(room.id, room)
@@ -2486,9 +2507,10 @@ export function apply(ctx, config = {}) {
   }
 
   async function renameRoom(room, raw) {
+    if (raw && Object.prototype.hasOwnProperty.call(raw, 'workdir')) room.workdir = normalizeRoomWorkdir(raw.workdir)
     const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 80) : ''
-    if (!name) throw new HttpError(400, '聊天名称不能为空')
-    room.name = name
+    if (name) room.name = name
+    else if (raw && Object.prototype.hasOwnProperty.call(raw, 'name')) throw new HttpError(400, '聊天名称不能为空')
     room.updatedAt = nowIso()
     await persist()
     return room
