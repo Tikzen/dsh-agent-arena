@@ -1301,6 +1301,7 @@ function ChatView(props: {
   const availableInvitees = (profiles?.aiUsers ?? []).filter(profile => !room.participants.some(item => item.id === profile.id))
 
   useEffect(() => { setRoomName(room.name) }, [room.name])
+  useEffect(() => { setRoomWorkdir(room.workdir ?? '') }, [room.id, room.workdir])
 
   useEffect(() => {
     const element = scrollRef.current
