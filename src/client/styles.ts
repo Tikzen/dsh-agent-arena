@@ -82,6 +82,19 @@ export const ARENA_CSS = String.raw`
 [class*="_scrollBody"]:has(.arena-backdrop[data-embedded="true"]) { overflow: hidden !important; }
 [class*="_scrollBody"]:has(.arena-backdrop[data-embedded="true"]) > [class*="_composerSeat"] { display: none !important; }
 [class*="_viewArea"]:has(.arena-backdrop[data-embedded="true"]) { flex: 1 1 auto; width: 100%; height: 100% !important; min-height: 0; overflow: hidden; }
+/* The standalone panel is a full-viewport modal rendered inside the shell's overlay
+   layer, and it paints from the same DSH surface tokens as the shell. A theme that
+   fades those tokens to an alpha to reveal a wallpaper therefore makes this panel
+   see-through as well, so the shell underneath (sidebar, conversation, composer)
+   bleeds into the Arena UI instead of staying behind it. Suppress the shell while
+   the panel is open rather than making this panel opaque: such themes paint the
+   wallpaper outside the frame (a body child at z-index -1), so it keeps showing
+   through the panel, while an opaque theme already covered the shell and is
+   unaffected. The embedded view owns the conversation body instead of covering the
+   shell, so it is excluded. */
+[class*="_frame"]:has(> [data-shell-overlay] .arena-backdrop:not([data-embedded="true"])) > :not([data-shell-overlay]) {
+  visibility: hidden !important;
+}
 .arena-modal {
   box-sizing: border-box;
   width: 100vw;
