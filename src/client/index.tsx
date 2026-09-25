@@ -205,6 +205,7 @@ interface ChatRoom {
   updatedAt: string
   activityMonitor?: ActivityMonitor
   permissions?: Record<string, string>
+  workdir?: string
 }
 
 interface RoleActivityEvent {
@@ -1272,17 +1273,19 @@ function ChatView(props: {
   onSend: (text: string) => Promise<void>
   onRetry: () => Promise<void>
   onRename: (name: string) => Promise<void>
+  onSetWorkdir: (workdir: string) => Promise<void>
   onInvite: (profileIds: string[]) => Promise<void>
   onDelete: () => Promise<void>
   onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void>
   onPermission: (profileId: string, mode: string) => Promise<void>
 }): ReactNode {
-  const { room, profiles, onSend, onRetry, onRename, onInvite, onDelete, onApproval, onPermission } = props
+  const { room, profiles, onSend, onRetry, onRename, onSetWorkdir, onInvite, onDelete, onApproval, onPermission } = props
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [roomName, setRoomName] = useState(room.name)
+  const [roomWorkdir, setRoomWorkdir] = useState(room.workdir ?? '')
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsError, setSettingsError] = useState('')
@@ -1298,6 +1301,7 @@ function ChatView(props: {
   const availableInvitees = (profiles?.aiUsers ?? []).filter(profile => !room.participants.some(item => item.id === profile.id))
 
   useEffect(() => { setRoomName(room.name) }, [room.name])
+  useEffect(() => { setRoomWorkdir(room.workdir ?? '') }, [room.id, room.workdir])
 
   useEffect(() => {
     const element = scrollRef.current
@@ -1335,6 +1339,18 @@ function ChatView(props: {
     try { await onRename(roomName.trim()) } catch (cause) {
       setSettingsError(cause instanceof Error ? cause.message : String(cause))
     } finally { setSettingsBusy(false) }
+  }
+
+  const saveRoomWorkdir = async (): Promise<void> => {
+    setSettingsBusy(true)
+    setSettingsError('')
+    try {
+      await onSetWorkdir(roomWorkdir.trim())
+    } catch (cause) {
+      setSettingsError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setSettingsBusy(false)
+    }
   }
 
   const inviteMembers = async (): Promise<void> => {
@@ -1376,6 +1392,7 @@ function ChatView(props: {
         <aside className="arena-chat-settings" aria-label={room.type === 'group' ? '群设置' : '聊天设置'}>
           <div className="arena-chat-settings__head"><div><strong>{room.type === 'group' ? '群设置' : '聊天设置'}</strong><span>修改名称{room.type === 'group' ? '并邀请新的 AI 用户' : ''}</span></div><button type="button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}>×</button></div>
           <label className="arena-field"><span>{room.type === 'group' ? '群聊名称' : '聊天名称'}</span><div className="arena-settings-name"><input className="arena-input" value={roomName} maxLength={80} onChange={event => setRoomName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomName() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomName.trim() === room.name} onClick={() => void saveRoomName()}>保存名称</button></div></label>
+          <label className="arena-field"><span>工作区目录</span><div className="arena-settings-name"><input className="arena-input" value={roomWorkdir} placeholder="留空 = 跟随 dsh web 启动目录；例如 D:\mine\项目名" onChange={event => setRoomWorkdir(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomWorkdir() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomWorkdir === (room.workdir ?? '')} onClick={() => void saveRoomWorkdir()}>保存工作区</button></div><small className="arena-field-hint">本群 AI 成员执行文件与命令的工作目录（绝对路径，需已存在）。修改后对新发起的角色工作生效。</small></label>
           {room.type === 'group' ? <section><div className="arena-chat-settings__section"><strong>邀请 AI 用户</strong><span>当前 {room.participants.length}/12 位 AI</span></div>{availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : room.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">AI 用户库中没有可邀请的新成员。</div>}<button className="arena-launch arena-invite-submit" type="button" disabled={settingsBusy || !inviteIds.length} onClick={() => void inviteMembers()}>{settingsBusy ? '处理中…' : `邀请选中的 ${inviteIds.length || ''} 位成员`}</button></section> : null}
           <section className="arena-permission-section"><div className="arena-chat-settings__section"><strong>本聊天的 Agent 权限</strong><span>每个对话单独生效；默认 Full access</span></div>{room.participants.map(profile => <label className="arena-permission-row" key={profile.id}><Avatar value={profile.avatar} name={profile.name} /><span>{profile.name}</span><select value={room.permissions?.[profile.id] || 'danger-full-access'} onChange={event => void onPermission(profile.id, event.target.value)}><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option><option value="danger-full-access">Full access</option></select></label>)}</section>
           {settingsError ? <div className="arena-error">{settingsError}</div> : null}
@@ -2034,6 +2051,12 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     await renameRoomRecord(selectedRoom.id, name)
   }
 
+  const setSelectedRoomWorkdir = async (workdir: string): Promise<void> => {
+    if (!selectedRoom) return
+    const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}`, { method: 'PATCH', body: JSON.stringify({ workdir }) })
+    setState(current => ({ ...current, rooms: (current.rooms ?? []).map(room => room.id === selectedRoom.id ? result.room : room) }))
+  }
+
   const inviteRoomMembers = async (profileIds: string[]): Promise<void> => {
     if (!selectedRoom) return
     const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/members`, { method: 'POST', body: JSON.stringify({ profileIds }) })
@@ -2169,7 +2192,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                  ) : view === 'create-chat' ? (
                   <CreateChatView profiles={state.profiles} initialType={chatType} onManageProfiles={() => setView('profiles')} onCreated={roomCreated} />
                 ) : view === 'chat' && selectedRoom ? (
-                  <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onInvite={inviteRoomMembers} onDelete={deleteRoom} onApproval={resolveApproval} onPermission={setRoomPermission} />
+                  <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onSetWorkdir={setSelectedRoomWorkdir} onInvite={inviteRoomMembers} onDelete={deleteRoom} onApproval={resolveApproval} onPermission={setRoomPermission} />
                 ) : view === 'setup' || !selected ? (
                   <SetupView
                     templates={state.templates.length ? state.templates : FALLBACK_TEMPLATES}
