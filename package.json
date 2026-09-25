@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-arena",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Interactive multi-agent council and prompt arena for DeepSeek Harness",
   "keywords": [
     "deepseek",
@@ -19,6 +19,7 @@
   },
   "files": [
     "lib",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
@@ -38,7 +39,8 @@
       "inject": [
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
       ],
       "platform": "web"
     }

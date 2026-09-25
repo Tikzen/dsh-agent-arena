@@ -102,6 +102,7 @@ export const ARENA_CSS = String.raw`
   min-width: 0;
   height: 100dvh;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   border: 0;
@@ -112,7 +113,7 @@ export const ARENA_CSS = String.raw`
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   animation: arena-rise .2s ease-out;
 }
-.arena-header { position: relative; z-index: 5; background: var(--dsw-alias-bg-base, #fff); box-shadow: 0 5px 24px rgba(0,0,0,.045); }
+.arena-header { position: relative; min-width: 0; z-index: 5; background: var(--dsw-alias-bg-base, #fff); box-shadow: 0 5px 24px rgba(0,0,0,.045); }
 .arena-topbar {
   display: flex;
   align-items: center;
@@ -487,6 +488,10 @@ export const ARENA_CSS = String.raw`
 .arena-chat-settings__head > button { width: 26px; height: 26px; border: 1px solid var(--dsw-alias-border-l1, #dddde5); border-radius: 8px; background: transparent; color: inherit; cursor: pointer; }
 .arena-settings-name { display: flex; gap: 7px; }
 .arena-settings-name .arena-input { min-width: 0; }
+.arena-workdir-settings { margin-top: 14px; min-width: 0; }
+.arena-workdir-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+.arena-workdir-actions [role="status"] { font-size: 12px; color: var(--dsw-alias-label-caption, #777883); }
+.arena-workdir-settings .arena-field-hint { display: block; overflow-wrap: anywhere; }
 .arena-chat-settings section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--dsw-alias-border-l1, #e1e1e7); }
 .arena-chat-settings__section { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
 .arena-chat-settings__section strong { font-size: 11px; }
@@ -516,7 +521,7 @@ export const ARENA_CSS = String.raw`
 .arena-watch-head-resizer::after { content: ''; position: absolute; top: 5px; right: 12px; left: 12px; height: 3px; border-radius: 99px; background: color-mix(in srgb, #7665e8 42%, transparent); transition: background .15s ease, transform .15s ease; }
 .arena-watch-head-resizer:hover::after, .arena-watch-head-resizer:focus-visible::after { background: #7665e8; transform: scaleY(1.35); }
 .arena-watch-head__title { flex: 1; min-width: 0; }
-.arena-watch-head__actions { flex: none; min-width: 0; display: flex; align-items: center; gap: 8px; }
+.arena-watch-head__actions { flex: none; min-width: 0; display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px; max-width: 55%; }
 .arena-watch-head h2 { width: 100%; max-width: 100%; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--arena-watch-title-size, 17px); transition: font-size .12s ease; }
 .arena-meta { min-width: 0; display: flex; gap: 9px; overflow: hidden; margin-top: 6px; color: var(--dsw-alias-label-caption, #777883); font-size: var(--arena-watch-meta-size, 11px); transition: font-size .12s ease; }
 .arena-meta span { flex: none; }
@@ -735,7 +740,11 @@ body.arena-is-row-resizing, body.arena-is-row-resizing * { cursor: row-resize !i
   .arena-template-grid { grid-template-columns: 1fr; }
   .arena-chat-user-grid { grid-template-columns: 1fr; }
   .arena-chat-head__actions .arena-control--danger { display: none; }
- .arena-chat-settings { top: 58px; right: 8px; width: calc(100% - 16px); max-height: calc(100% - 68px); }
+  .arena-chat-settings { top: 58px; right: 8px; width: calc(100% - 16px); max-height: calc(100% - 68px); }
+  /* Let chat settings use the full chat-and-monitor area on narrow screens. */
+  .arena-chat-layout { position: relative; }
+  .arena-chat:has(> .arena-chat-settings) { position: static; }
+  .arena-chat-layout .arena-chat-settings { top: 8px; max-height: calc(100% - 16px); }
   .arena-invite-list { grid-template-columns: 1fr; }
   .arena-setup-row { grid-template-columns: 1fr; }
   .arena-selected-grid { grid-template-columns: 1fr; }
@@ -754,12 +763,19 @@ body.arena-is-row-resizing, body.arena-is-row-resizing * { cursor: row-resize !i
   .arena-chat-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(150px, 32%); overflow-y: hidden; }
   .arena-chat-resizer { display: none; }
   .arena-chat-side { border-top: 1px solid var(--dsw-alias-border-l1, #e1e1e7); border-left: 0; }
-  .arena-collab-layout { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
+  /* Let translated headings and actions grow instead of clipping them into a
+     desktop-height header. Scroll the meeting as a whole on small screens. */
+  .arena-watch { display: flex; flex-direction: column; overflow-y: auto; }
+  .arena-watch-head { flex: none; height: auto; min-height: var(--arena-watch-head-height, 82px); flex-wrap: wrap; }
+  .arena-watch-head__title { flex-basis: 100%; }
+  .arena-watch-head__actions { max-width: 100%; justify-content: flex-start; }
+  .arena-meta { flex-wrap: wrap; }
+  .arena-collab-layout { flex: none; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(220px, 50vh) minmax(270px, 42vh); overflow: hidden; }
   .arena-workspace-resizer { display: none; }
-  .arena-collab-layout .arena-stage { overflow: visible; }
+  .arena-collab-layout .arena-stage { overflow: auto; }
   .arena-vote-panel { max-height: 210px; border-top: 1px solid var(--dsw-alias-border-l1, #e1e1e7); border-left: 0; }
   .arena-workspace-panel { min-height: 270px; max-height: 42vh; border-top: 1px solid var(--dsw-alias-border-l1, #e1e1e7); border-left: 0; }
-  .arena-controls { flex-wrap: wrap; }
+  .arena-controls { flex: none; flex-wrap: wrap; }
   .arena-intervene { order: -1; flex-basis: 100%; }
 }
 @media (max-height: 520px) {

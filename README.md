@@ -8,6 +8,44 @@
 
 <p align="center"><sub>直接选择已经配置好的 AI 用户，创建长期协作会议，而不是重复填写 provider 和 model。</sub></p>
 
+## v0.5.0 更新速览
+
+这次更新让不同协作群可以在各自的项目目录工作，解决透明主题下的界面重叠，并让 Agent Arena 直接跟随 DSH 切换中英文。
+
+### 每场对话独立的工作区
+
+会议、群聊和私聊都可以在各自的设置中保存**工作区目录**，让角色和管理员在对应项目中执行文件与命令操作，无需为了两个项目启动两份 DSH。
+
+- 输入已经存在的绝对目录；留空则跟随 DSH 启动目录。
+- 每场对话分别保存，切换会话不会串用未保存的输入；无效目录会明确提示且不覆盖原设置。
+- 正在执行的同一批任务保持原工作目录，下一批任务才使用新设置，避免运行中切换路径。
+- 文件协作锁跟随任务所在的工作区解析，降低多角色编辑同一文件时的冲突风险。
+
+**工作区目录不等于安全沙箱。** `Read Only`、`Workspace Write` 和 `Full access` 权限仍需独立设置。
+
+### 透明主题与窄屏布局修复
+
+全屏打开 Arena 时，底层 DSH 侧栏、聊天和输入区不再透过透明主题叠到插件上；退出后恢复原界面，会话内嵌模式不受影响，也不会强制取消壁纸透明效果。另修复窄屏标题、长英文按钮以及聊天与协作面板重叠的问题，让底部操作能正常滚动到。
+
+### 跟随 DSH 切换中英文
+
+进入 **DSH 设置 → 通用设置 → 语言**（**Settings → General → Language**）选择中文或 English 即可。插件不增加独立语言开关，已打开的页面即时更新，未保存的输入也会保留。
+
+- 会议、私聊、群聊、AI 用户管理、协作设置和历史管理统一切换。
+- 任务板、决策板、成果库、角色动态、权限及审批操作同步切换。
+- 插件生成的新系统提示与校验错误支持双语显示，日期格式跟随语言。
+- **只切换界面，不翻译对话内容**：角色名称与人格、预设对话、历史消息、任务内容及模型/供应商原始错误保持原文。无法可靠识别的旧版系统提示也保留原文。
+
+翻译维护方式见 [本地化开发说明](docs/localization.md)。
+
+### 感谢贡献者 / Thanks to our contributors
+
+感谢 [@linkhaha](https://github.com/linkhaha) 在 [PR #1](https://github.com/Tikzen/dsh-agent-arena/pull/1) 中深度使用并贡献每个聊天独立工作区的功能，也感谢 [@ShakeCrane](https://github.com/ShakeCrane) 在 [PR #2](https://github.com/Tikzen/dsh-agent-arena/pull/2) 中提供透明主题下的界面隔离修复和回归测试。
+
+也向两位说声抱歉：这段时间忙于课业，忘记及时处理消息和 PR，让你们久等了。谢谢你们的耐心、认真反馈与贡献！
+
+Special thanks to **@linkhaha** for per-chat working directories and **@ShakeCrane** for the translucent-theme fix and regression tests. I'm sorry for the delayed replies and PR reviews—I was busy with coursework and forgot to follow up on the messages. Thank you both for your patience and contributions!
+
 ## v0.4.0 权限与协作界面更新
 
 - **每个对话独立设置 Agent 权限**：会议和群聊中的每个 AI 角色（包括管理员）都可以分别选择 `Read Only`、`Workspace Write` 或 `Full access`，不会修改该角色在其他对话中的权限。
@@ -169,6 +207,7 @@ AI 完成文件、链接、结论或阶段总结后，可以登记到成果库�
 
 - Node.js 22 或更高版本
 - DeepSeek Harness Web profile
+- v0.5.0 的语言切换依赖 DSH 原生 locale 服务；本版本在 DSH `0.1.1-rc.2` 上完成本地验收
 - 至少一个已经在 DSH 设置中配置好的模型供应商
 
 ## 安装
@@ -196,7 +235,7 @@ npm run build
 本仓库提交了预构建的 `lib/`，安装时不需要本机 TypeScript 工具链。推荐固定到正式版本：
 
 ```powershell
-<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.4.0"
+<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.5.0"
 ```
 
 如果希望直接跟随 `main` 分支的最新开发版本：

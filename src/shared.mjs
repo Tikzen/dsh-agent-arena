@@ -1,3 +1,4 @@
+import { uiMessage, uiError } from './localization.mjs'
 export const API_ROOT = '/api/plugins/dsh-agent-arena'
 
 export const MEETING_STAGES = ['discussion', 'planning', 'execution', 'review', 'waiting-human', 'completed']
@@ -80,16 +81,16 @@ export function cleanAvatar(value, fallback = '🤖') {
 
 export function validateMeetingInput(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new TypeError('请求体必须是 JSON 对象')
+    throw uiError(uiMessage("validatemeetinginput.the.request.body.must.be.a.json.object"), 400, TypeError)
   }
 
   const topic = cleanString(raw.topic, 2000)
-  if (topic.length < 2) throw new TypeError('会议主题至少需要 2 个字符')
+  if (topic.length < 2) throw uiError(uiMessage("validatemeetinginput.the.meeting.topic.must.contain.at.least.2.characters"), 400, TypeError)
 
   const template = templateById(cleanString(raw.template, 40))
   const sourceParticipants = Array.isArray(raw.participants) ? raw.participants : template.participants
   if (sourceParticipants.length < 2 || sourceParticipants.length > 4) {
-    throw new TypeError('参会 AI 数量必须在 2 到 4 个之间')
+    throw uiError(uiMessage("validatemeetinginput.a.meeting.must.start.with.2.4.ai.participants"), 400, TypeError)
   }
 
   const names = new Set()
@@ -97,7 +98,7 @@ export function validateMeetingInput(raw) {
     const fallback = template.participants[index % template.participants.length]
     const name = cleanString(source?.name, 24) || fallback.name
     const key = name.toLocaleLowerCase()
-    if (names.has(key)) throw new TypeError(`参会者名称不能重复：${name}`)
+    if (names.has(key)) throw uiError(uiMessage("validatemeetinginput.participant.names.must.be.unique.value", { p0: name }), 400, TypeError)
     names.add(key)
     const role = cleanString(source?.role, 16_000) || fallback.role
     const provider = cleanString(source?.provider, 100)
@@ -188,11 +189,13 @@ export function isArenaSessionPrompt(value) {
 }
 
 const MUTE_PHRASES = [
+  'stop talking', 'stop replying', 'stay quiet', 'be quiet', 'mute',
   '不要再说话', '不要说话', '先别说话', '别说话', '不要再回复', '不要回复', '先别回复', '别回复',
   '暂停发言', '停止发言', '保持安静', '闭嘴',
 ]
 
 const UNMUTE_PHRASES = [
+  'you can speak again', 'resume speaking', 'resume replying', 'unmute',
   '可以继续说话了', '可以说话了', '继续说话', '恢复说话', '可以继续回复了', '可以回复了',
   '继续回复', '恢复回复', '恢复发言', '解除静默', '取消静默',
 ]
@@ -215,7 +218,7 @@ export function parseSpeechDirectives(text, profiles) {
   const unmuteIds = new Set()
   const mutePattern = phrasePattern(MUTE_PHRASES)
   const unmutePattern = phrasePattern(UNMUTE_PHRASES)
-  const allNames = '(?:大家|所有人|所有AI|全部AI|你们|全员)'
+  const allNames = '(?:大家|所有人|所有AI|全部AI|你们|全员|everyone|all AI users|all members)'
   const muteAll = new RegExp(`${allNames}.{0,8}(?:${mutePattern})|(?:${mutePattern}).{0,8}${allNames}`, 'i').test(source)
   const unmuteAll = new RegExp(`${allNames}.{0,8}(?:${unmutePattern})|(?:${unmutePattern}).{0,8}${allNames}`, 'i').test(source)
   const ordered = [...profiles]
@@ -235,9 +238,10 @@ export function parseSpeechDirectives(text, profiles) {
   const hasDirective = muteIds.size > 0 || unmuteIds.size > 0
   let remainder = source
   for (const profile of ordered) remainder = remainder.replace(new RegExp(`@?${escapeRegExp(profile.name)}`, 'gi'), '')
-  for (const phrase of [...UNMUTE_PHRASES, ...MUTE_PHRASES]) remainder = remainder.replaceAll(phrase, '')
+  for (const phrase of [...UNMUTE_PHRASES, ...MUTE_PHRASES]) remainder = remainder.replace(new RegExp(escapeRegExp(phrase), 'gi'), '')
   remainder = remainder
     .replace(/大家|所有人|所有AI|全部AI|你们|全员/gi, '')
+    .replace(/\b(?:everyone|all AI users|all members|please)\b/gi, '')
     .replace(/请|麻烦|让|叫|我|你|他|她|它|就|也|再|先|一下|暂时|现在|已经|了|吧|哦|哈/g, '')
     .replace(/[\s，。！？、,.!?:：；;~～“”"'（）()]+/g, '')
 

@@ -4,6 +4,8 @@ import { BRAND_LOGOS } from './brand-logos.generated'
 import type { BrandLogoId } from './brand-logos.generated'
 import { CUSTOM_BRAND_IMAGES } from './custom-brand-images'
 import { ARENA_CSS } from './styles'
+import { t, useArenaLocale, installArenaLocale, localeTag, systemText, errorText, templateText, ArenaRequestError, captureError, notice } from './i18n'
+import type { MessageDescriptor, UiNotice } from './i18n'
 
 const API_ROOT = '/api/plugins/dsh-agent-arena'
 const OPEN_EVENT = 'dsh-agent-arena:open'
@@ -29,6 +31,7 @@ interface Template {
 }
 
 interface TranscriptItem {
+  i18n?: MessageDescriptor
   id: string
   kind: 'system' | 'participant' | 'user' | 'judge' | 'admin'
   round?: number
@@ -115,6 +118,7 @@ interface MeetingArtifact {
 
 interface Meeting {
   id: string
+  workdir?: string
   topic: string
   displayName?: string
   template: string
@@ -175,6 +179,7 @@ interface ApprovalRequest {
 }
 
 interface ChatMessage {
+  i18n?: MessageDescriptor
   id: string
   kind: 'human' | 'ai' | 'admin' | 'system'
   senderId: string
@@ -191,6 +196,7 @@ interface ChatMessage {
 
 interface ChatRoom {
   id: string
+  workdir?: string
   type: 'direct' | 'group'
   name: string
   participants: UserProfile[]
@@ -205,10 +211,10 @@ interface ChatRoom {
   updatedAt: string
   activityMonitor?: ActivityMonitor
   permissions?: Record<string, string>
-  workdir?: string
 }
 
 interface RoleActivityEvent {
+  i18n?: MessageDescriptor
   id: string
   kind: string
   text: string
@@ -216,6 +222,9 @@ interface RoleActivityEvent {
 }
 
 interface RoleActivity {
+  stageI18n?: MessageDescriptor
+  detailI18n?: MessageDescriptor
+  currentToolI18n?: MessageDescriptor
   profileId: string
   name: string
   avatar: string
@@ -287,44 +296,44 @@ const FALLBACK_TEMPLATES: Template[] = [
   },
 ]
 
-const STATUS_TEXT: Record<string, string> = {
-  queued: '排队中', running: '协作中', pausing: '本条后暂停', paused: '等待新消息',
-  completed: '等待新消息', stopped: '等待新消息', failed: '等待新消息', interrupted: '等待新消息',
-}
+function STATUS_TEXT(): Record<string, string> { return {
+  queued: t("status.queued"), running: t("status.collaborating"), pausing: t("status.pausing.after.this.message"), paused: t("status.waiting.for.a.new.message"),
+  completed: t("status.waiting.for.a.new.message"), stopped: t("status.waiting.for.a.new.message"), failed: t("status.waiting.for.a.new.message"), interrupted: t("status.waiting.for.a.new.message"),
+} }
 
-const MEETING_STAGE_TEXT: Record<MeetingStage, string> = {
-  discussion: '讨论', planning: '规划', execution: '并行执行', review: '交叉评审',
-  'waiting-human': '等待你决定', completed: '已完成',
-}
+function MEETING_STAGE_TEXT(): Record<MeetingStage, string> { return {
+  discussion: t("meeting_stage.discussion"), planning: t("meeting_stage.planning"), execution: t("meeting_stage.parallel.execution"), review: t("meeting_stage.peer.review"),
+  'waiting-human': t("meeting_stage.awaiting.your.decision"), completed: t("meeting_stage.completed"),
+} }
 
-const TASK_STATUS_TEXT: Record<TaskStatus, string> = {
-  todo: '待开始', 'in-progress': '进行中', review: '待评审', done: '已完成', blocked: '受阻', paused: '已暂停',
-}
+function TASK_STATUS_TEXT(): Record<TaskStatus, string> { return {
+  todo: t("task_status.not.started"), 'in-progress': t("task_status.in.progress"), review: t("task_status.awaiting.review"), done: t("meeting_stage.completed"), blocked: t("task_status.blocked"), paused: t("task_status.paused"),
+} }
 
 function meetingTitle(meeting: Meeting): string {
   return meeting.displayName?.trim() || meeting.topic
 }
 
-const LOGO_PRESETS = [
+function LOGO_PRESETS() { return [
   { id: 'deepseek', label: 'DeepSeek' },
   { id: 'openai', label: 'OpenAI' },
   { id: 'claude', label: 'Claude' },
   { id: 'gemini', label: 'Gemini' },
-  { id: 'qwen', label: '通义千问' },
+  { id: 'qwen', label: t("logo.qwen") },
   { id: 'kimi', label: 'Kimi' },
   { id: 'grok', label: 'Grok' },
-  { id: 'doubao', label: '豆包' },
+  { id: 'doubao', label: t("logo.doubao") },
   { id: 'metaai', label: 'Meta AI' },
   { id: 'mistral', label: 'Mistral' },
-] as const
+] as const }
 
 async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_ROOT}${path}`, {
     ...init,
     headers: { accept: 'application/json', 'content-type': 'application/json', ...init?.headers },
   })
-  const data = await response.json() as T & { error?: string }
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`)
+  const data = await response.json() as T & { error?: string; errorI18n?: MessageDescriptor }
+  if (!response.ok) throw new ArenaRequestError(data.error || `HTTP ${response.status}`, data.errorI18n)
   return data
 }
 
@@ -348,12 +357,12 @@ function Avatar(props: { value?: string; name: string; className?: string }): Re
   const { value = '🤖', name, className = '' } = props
   const logoId = brandLogoId(value)
   if (logoId) {
-    return <span className={`arena-avatar arena-avatar--brand ${className}`} aria-label={`${name} 的头像`}><BrandLogo id={logoId} /></span>
+    return <span className={`arena-avatar arena-avatar--brand ${className}`} aria-label={t("avatar.value.s.avatar", { p0: name })}><BrandLogo id={logoId} /></span>
   }
   if (value.startsWith('data:image/')) {
-    return <span className={`arena-avatar ${className}`}><img src={value} alt={`${name} 的头像`} /></span>
+    return <span className={`arena-avatar ${className}`}><img src={value} alt={t("avatar.value.s.avatar", { p0: name })} /></span>
   }
-  return <span className={`arena-avatar ${className}`} aria-label={`${name} 的头像`}>{value || name.slice(0, 1)}</span>
+  return <span className={`arena-avatar ${className}`} aria-label={t("avatar.value.s.avatar", { p0: name })}>{value || name.slice(0, 1)}</span>
 }
 
 interface AvatarCropDraft {
@@ -389,14 +398,14 @@ function cropDisplayMetrics(draft: AvatarCropDraft, zoom: number): { width: numb
 }
 
 async function imageFileForCrop(file: File): Promise<AvatarCropDraft> {
-  if (!file.type.startsWith('image/')) throw new Error('请选择图片文件')
-  if (file.size > 12 * 1024 * 1024) throw new Error('图片不能超过 12 MB')
+  if (!file.type.startsWith('image/')) throw new Error(t("avatar.please.select.an.image.file"))
+  if (file.size > 12 * 1024 * 1024) throw new Error(t("avatar.the.image.must.not.exceed.12.mb"))
   const url = URL.createObjectURL(file)
   try {
     const image = new Image()
     await new Promise<void>((resolve, reject) => {
       image.onload = () => resolve()
-      image.onerror = () => reject(new Error('无法读取这张图片'))
+      image.onerror = () => reject(new Error(t("avatar.unable.to.read.this.image")))
       image.src = url
     })
     return { image, url }
@@ -424,14 +433,14 @@ function croppedAvatar(draft: AvatarCropDraft, zoom: number, x: number, y: numbe
   canvas.width = outputSize
   canvas.height = outputSize
   const context = canvas.getContext('2d')
-  if (!context) throw new Error('浏览器不支持头像处理')
+  if (!context) throw new Error(t("avatar.your.browser.does.not.support.avatar.processing"))
   context.drawImage(image, sx, sy, sourceSize, sourceSize, 0, 0, outputSize, outputSize)
   return canvas.toDataURL('image/webp', 0.86)
 }
 
 function AvatarEditor(props: { value: string; name: string; onChange: (value: string) => void }): ReactNode {
   const { value, name, onChange } = props
-  const [error, setError] = useState('')
+  const [error, setError] = useState<UiNotice>('')
   const [cropDraft, setCropDraft] = useState<AvatarCropDraft | null>(null)
   const [cropZoom, setCropZoom] = useState(1)
   const [cropX, setCropX] = useState(0)
@@ -452,7 +461,7 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
       setCropY(0)
       setError('')
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     }
   }
 
@@ -463,7 +472,7 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
       setCropDraft(null)
       setError('')
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     }
   }
 
@@ -528,13 +537,13 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
     <div className="arena-avatar-editor">
       <Avatar value={value} name={name} className="arena-avatar--large" />
       <div>
-        <label className="arena-avatar-upload">上传并裁剪<input type="file" accept="image/*" onChange={event => { void upload(event.target.files?.[0]); event.currentTarget.value = '' }} /></label>
-        <input className="arena-input arena-emoji-input" value={value.startsWith('data:image/') || value.startsWith('logo:') ? '' : value} placeholder="或输入 emoji" maxLength={16} onChange={event => onChange(event.target.value)} />
-        {error ? <span className="arena-inline-error">{error}</span> : null}
+        <label className="arena-avatar-upload">{t("avatar.upload.and.crop")}<input type="file" accept="image/*" onChange={event => { void upload(event.target.files?.[0]); event.currentTarget.value = '' }} /></label>
+        <input className="arena-input arena-emoji-input" value={value.startsWith('data:image/') || value.startsWith('logo:') ? '' : value} placeholder={t("avatar.or.enter.an.emoji")} maxLength={16} onChange={event => onChange(event.target.value)} />
+        {error ? <span className="arena-inline-error">{errorText(error)}</span> : null}
       </div>
-      <div className="arena-logo-library" aria-label="AI 品牌预设头像">
-        {LOGO_PRESETS.map(preset => (
-          <button type="button" key={preset.id} title={`使用 ${preset.label} 官方品牌图标`} onClick={() => onChange(`logo:${preset.id}`)}>
+      <div className="arena-logo-library" aria-label={t("avatar.ai.brand.avatars")}>
+        {LOGO_PRESETS().map(preset => (
+          <button type="button" key={preset.id} title={t("avatar.use.the.official.value.brand.icon", { p0: preset.label })} onClick={() => onChange(`logo:${preset.id}`)}>
             <BrandLogo id={preset.id} /><span>{preset.label}</span>
           </button>
         ))}
@@ -542,19 +551,19 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
     </div>
     {cropDraft ? (
       <div className="arena-crop-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setCropDraft(null) }}>
-        <section className="arena-crop-dialog" role="dialog" aria-modal="true" aria-label="裁剪头像">
-          <div className="arena-crop-head"><div><strong>裁剪头像</strong><span>拖动图片调整位置，滚动鼠标滚轮缩放；也可以继续使用下方滑块</span></div><button type="button" aria-label="关闭裁剪" onClick={() => setCropDraft(null)}>×</button></div>
-          <div className="arena-crop-stage" aria-label="可拖动的头像裁剪区域" onPointerDown={startCropDrag} onPointerMove={moveCropDrag} onPointerUp={stopCropDrag} onPointerCancel={stopCropDrag} onWheel={zoomCropAtPointer}>
-            <img src={cropDraft.url} alt="待裁剪头像" style={cropStyle} />
+        <section className="arena-crop-dialog" role="dialog" aria-modal="true" aria-label={t("avatar.crop.avatar")}>
+          <div className="arena-crop-head"><div><strong>{t("avatar.crop.avatar")}</strong><span>{t("avatar.drag.the.image.to.position.it.and.scroll.to")}</span></div><button type="button" aria-label={t("avatar.close.crop.editor")} onClick={() => setCropDraft(null)}>×</button></div>
+          <div className="arena-crop-stage" aria-label={t("avatar.draggable.avatar.crop.area")} onPointerDown={startCropDrag} onPointerMove={moveCropDrag} onPointerUp={stopCropDrag} onPointerCancel={stopCropDrag} onWheel={zoomCropAtPointer}>
+            <img src={cropDraft.url} alt={t("avatar.image.to.crop")} style={cropStyle} />
             <div className="arena-crop-grid" aria-hidden="true"><i /><i /><i /><i /></div>
-            <span className="arena-crop-drag-hint" aria-hidden="true">拖动图片 · 滚轮缩放</span>
+            <span className="arena-crop-drag-hint" aria-hidden="true">{t("avatar.drag.to.move.scroll.to.zoom")}</span>
           </div>
           <div className="arena-crop-sliders">
-            <label><span>缩放</span><input type="range" min="1" max="3" step="0.01" value={cropZoom} onChange={event => setCropZoom(Number(event.target.value))} /></label>
-            <label><span>水平位置</span><input type="range" min="-100" max="100" step="1" value={cropX} onChange={event => setCropX(Number(event.target.value))} /></label>
-            <label><span>垂直位置</span><input type="range" min="-100" max="100" step="1" value={cropY} onChange={event => setCropY(Number(event.target.value))} /></label>
+            <label><span>{t("avatar.zoom")}</span><input type="range" min="1" max="3" step="0.01" value={cropZoom} onChange={event => setCropZoom(Number(event.target.value))} /></label>
+            <label><span>{t("avatar.horizontal.position")}</span><input type="range" min="-100" max="100" step="1" value={cropX} onChange={event => setCropX(Number(event.target.value))} /></label>
+            <label><span>{t("avatar.vertical.position")}</span><input type="range" min="-100" max="100" step="1" value={cropY} onChange={event => setCropY(Number(event.target.value))} /></label>
           </div>
-          <div className="arena-crop-actions"><button className="arena-control" type="button" onClick={() => setCropDraft(null)}>取消</button><button className="arena-launch" type="button" onClick={confirmCrop}>使用裁剪结果</button></div>
+          <div className="arena-crop-actions"><button className="arena-control" type="button" onClick={() => setCropDraft(null)}>{t("avatar.cancel")}</button><button className="arena-launch" type="button" onClick={confirmCrop}>{t("avatar.use.cropped.image")}</button></div>
         </section>
       </div>
     ) : null}
@@ -563,13 +572,14 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
 }
 
 export function ArenaHomeLaunch(): ReactNode {
+  useArenaLocale()
   return (
     <div className="arena-home-launch">
       <button className="arena-home-launch__inner" type="button" onClick={openArena}>
         <span className="arena-home-launch__icon">⚔️</span>
         <span className="arena-home-launch__copy">
-          <span className="arena-home-launch__title">进入 AI 协作群</span>
-          <span className="arena-home-launch__hint">多 AI 持续讨论与工作 · 支持任务分工、方案决策、成果验收</span>
+          <span className="arena-home-launch__title">{t("home.enter.ai.collaboration")}</span>
+          <span className="arena-home-launch__hint">{t("home.ongoing.multi.ai.discussion.and.work.tasks.decisions.and")}</span>
         </span>
         <span className="arena-home-launch__arrow">→</span>
       </button>
@@ -578,7 +588,7 @@ export function ArenaHomeLaunch(): ReactNode {
 }
 
 function WorkingDots(): ReactNode {
-  return <span className="arena-working" aria-label="思考中"><i /><i /><i /></span>
+  return <span className="arena-working" aria-label={t("activity.thinking")}><i /><i /><i /></span>
 }
 
 function SetupView(props: {
@@ -592,8 +602,8 @@ function SetupView(props: {
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? 'roundtable')
   const [participants, setParticipants] = useState<Participant[]>([])
   const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState('')
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [error, setError] = useState<UiNotice>('')
+  const [fieldErrors, setFieldErrors] = useState<Record<string, UiNotice>>({})
 
   const selectTemplate = (template: Template): void => {
     setTemplateId(template.id)
@@ -610,8 +620,8 @@ function SetupView(props: {
       return
     }
     if (participants.length >= 4) {
-      setError('一场会议最多选择 4 位 AI 用户。')
-      setFieldErrors(current => ({ ...current, participants: '已达到 4 位上限；请先移除一位再选择。' }))
+      setError(notice("meeting.a.meeting.can.start.with.up.to.4.ai"))
+      setFieldErrors(current => ({ ...current, participants: notice("meeting.the.limit.is.4.remove.a.participant.before.adding") }))
       return
     }
     const next: Participant = {
@@ -630,9 +640,9 @@ function SetupView(props: {
   }
 
   const launch = async (): Promise<void> => {
-    const nextErrors: Record<string, string> = {}
-    if (topic.trim().length < 2) nextErrors.topic = '请填写至少 2 个字的会议主题。'
-    if (participants.length < 2) nextErrors.participants = `请从 AI 用户库中再选择 ${2 - participants.length} 位参会者。`
+    const nextErrors: Record<string, UiNotice> = {}
+    if (topic.trim().length < 2) nextErrors.topic = notice("meeting.please.enter.a.meeting.topic.with.at.least.2")
+    if (participants.length < 2) nextErrors.participants = notice("meeting.select.value.more.participants.from.the.ai.user.library", { p0: 2 - participants.length })
     setFieldErrors(nextErrors)
     const firstError = Object.values(nextErrors)[0]
     if (firstError) {
@@ -648,7 +658,7 @@ function SetupView(props: {
       })
       onCreated(data.meeting)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally {
       setSubmitting(false)
     }
@@ -656,32 +666,32 @@ function SetupView(props: {
 
   const validationMessage = error || Object.values(fieldErrors).find(Boolean) || ''
   const selectionHint = participants.length < 2
-    ? `还需选择 ${2 - participants.length} 位 AI 用户才能开始会议。`
-    : `已选择 ${participants.length} 位 AI；模型将直接使用各自用户资料中的配置。`
+    ? t("meeting.select.value.more.ai.users.to.start.the.meeting", { p0: 2 - participants.length })
+    : t("meeting.value.ai.users.selected.each.will.use.the.model", { p0: participants.length })
 
   return (
     <div className="arena-setup">
       <div className="arena-page-scroll">
       <div className="arena-kicker">Agent Arena</div>
-      <h2>创建 AI 协作群</h2>
-      <p className="arena-lead">像 QQ 群聊一样持续讨论和工作：你可以随时发言、@ 指定 AI 回答，在协作控制台分工、决策并验收成果。会议不会按轮数自动结束。</p>
-      {validationMessage ? <div className="arena-page-alert" role="alert">无法开始会议：{validationMessage}</div> : null}
+      <h2>{t("meeting.create.an.ai.collaboration.group")}</h2>
+      <p className="arena-lead">{t("meeting.discuss.and.work.together.in.an.ongoing.group.chat")}</p>
+      {validationMessage ? <div className="arena-page-alert" role="alert">{t("meeting.unable.to.start.meeting")}{errorText(validationMessage)}</div> : null}
 
       <label className={`arena-field ${fieldErrors.topic ? 'has-error' : ''}`}>
-        <span>他们要讨论什么？</span>
+        <span>{t("meeting.what.should.they.discuss")}</span>
         <textarea
           className="arena-textarea"
           value={topic}
           aria-invalid={Boolean(fieldErrors.topic)}
           onChange={event => { setTopic(event.target.value); setFieldErrors(current => ({ ...current, topic: '' })); setError('') }}
-          placeholder="例如：这个多 AI 会议插件怎样设计，才既好玩又真的有用？"
+          placeholder={t("meeting.for.example.how.can.this.multi.ai.meeting.plugin")}
           maxLength={2000}
           autoFocus
         />
-        {fieldErrors.topic ? <span className="arena-field-error">{fieldErrors.topic}</span> : null}
+        {fieldErrors.topic ? <span className="arena-field-error">{errorText(fieldErrors.topic)}</span> : null}
       </label>
 
-      <span className="arena-section-title">会议形式</span>
+      <span className="arena-section-title">{t("meeting.meeting.format")}</span>
       <div className="arena-template-grid">
         {templates.map(template => (
           <button
@@ -690,17 +700,17 @@ function SetupView(props: {
             className={`arena-template ${template.id === templateId ? 'is-active' : ''}`}
             onClick={() => selectTemplate(template)}
           >
-            <strong>{template.name}</strong>
-            <span>{template.description}</span>
+            <strong>{templateText(template, 'name')}</strong>
+            <span>{templateText(template, 'description')}</span>
           </button>
         ))}
       </div>
 
       <div className="arena-saved-head">
-        <span className="arena-section-title">选择参会 AI 用户 · 已选 {participants.length}/4</span>
-        <button type="button" onClick={onManageProfiles}>管理 / 创建用户 →</button>
+        <span className="arena-section-title">{t("counts.selectedParticipants", { count: participants.length })}</span>
+        <button type="button" onClick={onManageProfiles}>{t("meeting.manage.create.users")}</button>
       </div>
-      <p className="arena-selection-help">直接选择用户即可。供应商和模型沿用该 AI 用户在用户中心保存的配置，这里不需要再次填写。</p>
+      <p className="arena-selection-help">{t("meeting.choose.users.directly.each.ai.uses.the.provider.and")}</p>
       {profiles?.aiUsers.length ? (
         <div className="arena-user-pills">
           {profiles.aiUsers.map(profile => {
@@ -715,13 +725,13 @@ function SetupView(props: {
           })}
         </div>
       ) : (
-        <button className="arena-empty-users" type="button" onClick={onManageProfiles}>还没有 AI 用户，请先创建至少 2 个 →</button>
+        <button className="arena-empty-users" type="button" onClick={onManageProfiles}>{t("meeting.no.ai.users.yet.create.at.least.2.first")}</button>
       )}
 
       <div className="arena-setup-row arena-setup-row--single">
         <div>
-          <span className="arena-section-title">本场参会阵容</span>
-          {fieldErrors.participants ? <span className="arena-field-error">{fieldErrors.participants}</span> : null}
+          <span className="arena-section-title">{t("meeting.meeting.participants")}</span>
+          {fieldErrors.participants ? <span className="arena-field-error">{errorText(fieldErrors.participants)}</span> : null}
           {participants.length ? (
             <div className="arena-selected-grid">
               {participants.map(participant => (
@@ -732,19 +742,19 @@ function SetupView(props: {
                     <small>{participant.role}</small>
                     <em>{participant.provider}/{participant.model}</em>
                   </span>
-                  <button type="button" aria-label={`移除 ${participant.name}`} onClick={() => { setParticipants(items => items.filter(item => item.profileId !== participant.profileId)); setError(''); setFieldErrors(current => ({ ...current, participants: '' })) }}>×</button>
+                  <button type="button" aria-label={t("meeting.remove.value", { p0: participant.name })} onClick={() => { setParticipants(items => items.filter(item => item.profileId !== participant.profileId)); setError(''); setFieldErrors(current => ({ ...current, participants: '' })) }}>×</button>
                 </div>
               ))}
             </div>
-          ) : <button className="arena-empty-users" type="button" onClick={onManageProfiles}>请从上方选择 AI 用户；没有用户时先去创建 →</button>}
+          ) : <button className="arena-empty-users" type="button" onClick={onManageProfiles}>{t("meeting.choose.ai.users.above.or.create.some.first")}</button>}
         </div>
       </div>
       </div>
 
       <div className="arena-action-dock">
-        <span className="arena-action-dock__message" data-error={Boolean(validationMessage) || participants.length < 2}>{validationMessage || selectionHint}</span>
+        <span className="arena-action-dock__message" data-error={Boolean(validationMessage) || participants.length < 2}>{errorText(validationMessage || selectionHint)}</span>
         <button className="arena-launch" type="button" disabled={submitting} onClick={() => void launch()}>
-          {submitting ? <><WorkingDots /> 正在召集</> : <>⚔️ 开始会议</>}
+          {submitting ? <><WorkingDots /> {t("meeting.gathering.participants")}</> : <>{t("meeting.start.meeting")}</>}
         </button>
       </div>
     </div>
@@ -765,9 +775,9 @@ function ProfilesView(props: {
   const { profiles, modelCatalog, defaultModel, onHumanSaved, onAdministratorSaved, onAiSaved, onAiDeleted, settings, onSettingsSaved } = props
   const initialProvider = defaultModel?.provider || modelCatalog[0]?.id || ''
   const initialModels = modelCatalog.find(item => item.id === initialProvider)?.models ?? []
-  const [human, setHuman] = useState<UserProfile>(profiles?.human ?? { id: 'human', name: '你', avatar: '🧑' })
+  const [human, setHuman] = useState<UserProfile>(profiles?.human ?? { id: 'human', name: t("users.you"), avatar: '🧑' })
   const [administrator, setAdministrator] = useState<UserProfile>(profiles?.administrator ?? {
-    id: 'administrator', name: '管理员', avatar: '🛡️',
+    id: 'administrator', name: t("users.administrator"), avatar: '🛡️',
     role: '维护协作秩序，并按人类用户要求调整话题、协作阶段与决策状态。',
     provider: initialProvider, model: defaultModel?.model || initialModels[0]?.id || '',
   })
@@ -778,8 +788,8 @@ function ProfilesView(props: {
   const [savingHuman, setSavingHuman] = useState(false)
   const [savingAdministrator, setSavingAdministrator] = useState(false)
   const [savingAi, setSavingAi] = useState(false)
-  const [message, setMessage] = useState('')
-  const [profileErrors, setProfileErrors] = useState<Record<string, string>>({})
+  const [message, setMessage] = useState<UiNotice>('')
+  const [profileErrors, setProfileErrors] = useState<Record<string, UiNotice>>({})
   const [preferences, setPreferences] = useState<ArenaSettings>(settings ?? { ...DEFAULT_ARENA_SETTINGS })
 
   useEffect(() => {
@@ -814,8 +824,8 @@ function ProfilesView(props: {
 
   const saveHuman = async (): Promise<void> => {
     if (!human.name.trim()) {
-      setProfileErrors(current => ({ ...current, humanName: '请填写你在聊天中显示的名称。' }))
-      setMessage('请先补全标红的必填项。')
+      setProfileErrors(current => ({ ...current, humanName: notice("users.please.enter.your.display.name") }))
+      setMessage(notice("users.please.complete.the.required.fields.highlighted.in.red"))
       return
     }
     setSavingHuman(true)
@@ -825,22 +835,22 @@ function ProfilesView(props: {
       const result = await jsonRequest<{ profile: UserProfile }>('/profiles/human', { method: 'POST', body: JSON.stringify(human) })
       setHuman(result.profile)
       onHumanSaved(result.profile)
-      setMessage('你的人类用户资料已保存。')
+      setMessage(notice("users.your.profile.has.been.saved"))
     } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause)
+      const detail = captureError(cause)
       setProfileErrors(current => ({ ...current, form: detail }))
       setMessage(detail)
     } finally { setSavingHuman(false) }
   }
 
   const saveAdministrator = async (): Promise<void> => {
-    const nextErrors: Record<string, string> = {}
-    if (!administrator.name.trim()) nextErrors.administratorName = '请填写管理员显示名称。'
-    if (!administrator.provider) nextErrors.administratorProvider = '请选择管理员供应商。'
-    if (!administrator.model) nextErrors.administratorModel = '请选择管理员模型。'
+    const nextErrors: Record<string, UiNotice> = {}
+    if (!administrator.name.trim()) nextErrors.administratorName = notice("users.please.enter.the.administrator.s.display.name")
+    if (!administrator.provider) nextErrors.administratorProvider = notice("users.please.choose.a.provider.for.the.administrator")
+    if (!administrator.model) nextErrors.administratorModel = notice("users.please.choose.a.model.for.the.administrator")
     if (Object.keys(nextErrors).length) {
       setProfileErrors(current => ({ ...current, ...nextErrors }))
-      setMessage('管理员配置还不完整。')
+      setMessage(notice("users.the.administrator.configuration.is.incomplete"))
       return
     }
     setSavingAdministrator(true)
@@ -853,22 +863,22 @@ function ProfilesView(props: {
       onSettingsSaved(settingsResult.settings)
       onAdministratorSaved(result.profile)
       setProfileErrors(current => ({ ...current, administratorName: '', administratorProvider: '', administratorModel: '', form: '' }))
-      setMessage('管理员资料已保存，新建会议和群聊会自动加入它。')
+      setMessage(notice("users.administrator.saved.it.will.automatically.join.new.meetings.and"))
     } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause)
+      const detail = captureError(cause)
       setProfileErrors(current => ({ ...current, form: detail }))
       setMessage(detail)
     } finally { setSavingAdministrator(false) }
   }
 
   const saveAi = async (): Promise<void> => {
-    const nextErrors: Record<string, string> = {}
-    if (!draft.name.trim()) nextErrors.name = '请给这个 AI 填写显示名称。'
-    if (!draft.provider) nextErrors.provider = modelCatalog.length ? '请选择供应商。' : 'DSH 中还没有可用供应商，请先前往系统设置配置模型。'
-    if (!draft.model) nextErrors.model = modelCatalog.length ? '请选择模型。' : '配置供应商后才能选择模型。'
+    const nextErrors: Record<string, UiNotice> = {}
+    if (!draft.name.trim()) nextErrors.name = notice("users.please.enter.a.display.name.for.this.ai")
+    if (!draft.provider) nextErrors.provider = modelCatalog.length ? notice("users.please.choose.a.provider") : notice("users.no.providers.are.available.in.dsh.configure.a.model")
+    if (!draft.model) nextErrors.model = modelCatalog.length ? notice("users.please.choose.a.model") : notice("users.configure.a.provider.before.choosing.a.model")
     if (Object.keys(nextErrors).length) {
       setProfileErrors(nextErrors)
-      setMessage('AI 用户还不能创建，请先补全标红的必填项。')
+      setMessage(notice("users.the.ai.user.cannot.be.created.yet.complete.the"))
       return
     }
     setSavingAi(true)
@@ -878,67 +888,67 @@ function ProfilesView(props: {
       const result = await jsonRequest<{ profile: UserProfile }>('/profiles/ai', { method: 'POST', body: JSON.stringify(draft) })
       onAiSaved(result.profile)
       resetDraft()
-      setMessage(`${result.profile.name} 已保存到 AI 用户库。`)
+      setMessage(notice("users.value.has.been.saved.to.the.ai.user.library", { p0: result.profile.name }))
     } catch (cause) {
-      const detail = cause instanceof Error ? cause.message : String(cause)
+      const detail = captureError(cause)
       setProfileErrors({ form: detail })
       setMessage(detail)
     } finally { setSavingAi(false) }
   }
 
   const deleteAi = async (profile: UserProfile): Promise<void> => {
-    if (!window.confirm(`删除 AI 用户“${profile.name}”？已有会议记录不会被删除。`)) return
+    if (!window.confirm(t("users.delete.ai.user.value.existing.meeting.records.will.not", { p0: profile.name }))) return
     try {
       await jsonRequest<{ ok: boolean }>(`/profiles/ai/${encodeURIComponent(profile.id)}`, { method: 'DELETE' })
       onAiDeleted(profile.id)
       if (draft.id === profile.id) resetDraft()
     } catch (cause) {
-      setMessage(cause instanceof Error ? cause.message : String(cause))
+      setMessage(captureError(cause))
     }
   }
 
   return (
     <div className="arena-profiles">
       <div className="arena-page-scroll">
-      <div className="arena-kicker">Social identities</div>
-      <h2>用户与头像</h2>
-      <p className="arena-lead">这里的“AI 用户”是可重复使用的角色账号。它保存显示名称、头像、角色设定以及 DSH 中已启用的供应商和模型。</p>
-      {message ? <div className={`arena-page-alert ${Object.values(profileErrors).some(Boolean) ? '' : 'is-success'}`} role="status">{message}</div> : null}
+      <div className="arena-kicker">{t("users.users.and.avatars")}</div>
+      <h2>{t("users.users.and.avatars")}</h2>
+      <p className="arena-lead">{t("users.an.ai.user.is.a.reusable.character.profile.containing")}</p>
+      {message ? <div className={`arena-page-alert ${Object.values(profileErrors).some(Boolean) ? '' : 'is-success'}`} role="status">{errorText(message)}</div> : null}
 
       <section className="arena-profile-section">
-        <div className="arena-profile-section__title"><strong>我的人类用户</strong><span>你的现场插话会使用这套名称和头像</span></div>
+        <div className="arena-profile-section__title"><strong>{t("users.my.human.profile")}</strong><span>{t("users.your.messages.will.use.this.name.and.avatar")}</span></div>
         <div className="arena-human-editor">
           <AvatarEditor value={human.avatar} name={human.name} onChange={avatar => setHuman(current => ({ ...current, avatar }))} />
-          <label className={`arena-field ${profileErrors.humanName ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.humanName)} value={human.name} maxLength={24} onChange={event => { setHuman(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, humanName: '' })); setMessage('') }} />{profileErrors.humanName ? <small className="arena-field-error">{profileErrors.humanName}</small> : null}</label>
-          <button className="arena-control" type="button" disabled={savingHuman} onClick={() => void saveHuman()}>{savingHuman ? '保存中…' : '保存我的资料'}</button>
+          <label className={`arena-field ${profileErrors.humanName ? 'has-error' : ''}`}><span>{t("users.display.name")} <b>{t("users.required")}</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.humanName)} value={human.name} maxLength={24} onChange={event => { setHuman(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, humanName: '' })); setMessage('') }} />{profileErrors.humanName ? <small className="arena-field-error">{errorText(profileErrors.humanName)}</small> : null}</label>
+          <button className="arena-control" type="button" disabled={savingHuman} onClick={() => void saveHuman()}>{savingHuman ? t("users.saving") : t("users.save.my.profile")}</button>
         </div>
       </section>
 
       <section className="arena-profile-section">
-        <div className="arena-profile-section__title"><strong>群管理员</strong><span>每个新会议和群聊都会自动加入；在聊天里 @它即可管理话题、协作阶段和决策状态</span></div>
+        <div className="arena-profile-section__title"><strong>{t("users.group.administrator")}</strong><span>{t("users.automatically.joins.new.meetings.and.group.chats.mention.it")}</span></div>
         <div className="arena-admin-editor">
           <AvatarEditor value={administrator.avatar} name={administrator.name} onChange={avatar => setAdministrator(current => ({ ...current, avatar }))} />
           <div className="arena-ai-form">
-            <label className={`arena-field ${profileErrors.administratorName ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" value={administrator.name} maxLength={24} onChange={event => { setAdministrator(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, administratorName: '' })) }} /></label>
-            <label className="arena-field"><span>管理员职责</span><textarea className="arena-textarea" value={administrator.role ?? ''} maxLength={16000} onChange={event => setAdministrator(current => ({ ...current, role: event.target.value }))} /></label>
-            <label className="arena-toggle arena-toggle--admin"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>自动接话总开关</strong><small>开启后沿用旧版分配模式：AI 先判断是否接话，再由管理员选择下一位发言者。<br />关闭后停止 AI 之间的自动接话，但不影响人类发言和明确 @AI。</small></span></label>
+            <label className={`arena-field ${profileErrors.administratorName ? 'has-error' : ''}`}><span>{t("users.display.name")} <b>{t("users.required")}</b></span><input className="arena-input" value={administrator.name} maxLength={24} onChange={event => { setAdministrator(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, administratorName: '' })) }} /></label>
+            <label className="arena-field"><span>{t("users.administrator.responsibilities")}</span><textarea className="arena-textarea" value={administrator.role ?? ''} maxLength={16000} onChange={event => setAdministrator(current => ({ ...current, role: event.target.value }))} /></label>
+            <label className="arena-toggle arena-toggle--admin"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>{t("users.automatic.follow.up.replies")}</strong><small>{t("users.when.enabled.the.original.allocation.flow.is.used.ai")}<br />{t("users.turning.this.off.stops.automatic.ai.to.ai.follow")}</small></span></label>
 
             <div className="arena-model-picker">
-              <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>供应商 <b>必填</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
+              <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>{t("users.provider")} <b>{t("users.required")}</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
                 const provider = event.target.value
                 const model = modelCatalog.find(item => item.id === provider)?.models[0]?.id || ''
                 setAdministrator(current => ({ ...current, provider, model }))
                 setProfileErrors(current => ({ ...current, administratorProvider: '', administratorModel: '' }))
               }}>{modelCatalog.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></label>
-              <label className={`arena-field ${profileErrors.administratorModel ? 'has-error' : ''}`}><span>模型 <b>必填</b></span><select className="arena-select" value={administrator.model ?? ''} onChange={event => { setAdministrator(current => ({ ...current, model: event.target.value })); setProfileErrors(current => ({ ...current, administratorModel: '' })) }}>{(administratorProviderEntry?.models ?? []).map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label>
-              <button className="arena-control arena-admin-save" type="button" disabled={savingAdministrator} onClick={() => void saveAdministrator()}>{savingAdministrator ? '保存中…' : '保存管理员'}</button>
+              <label className={`arena-field ${profileErrors.administratorModel ? 'has-error' : ''}`}><span>{t("users.model")} <b>{t("users.required")}</b></span><select className="arena-select" value={administrator.model ?? ''} onChange={event => { setAdministrator(current => ({ ...current, model: event.target.value })); setProfileErrors(current => ({ ...current, administratorModel: '' })) }}>{(administratorProviderEntry?.models ?? []).map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</select></label>
+              <button className="arena-control arena-admin-save" type="button" disabled={savingAdministrator} onClick={() => void saveAdministrator()}>{savingAdministrator ? t("users.saving") : t("users.save.administrator")}</button>
             </div>
           </div>
         </div>
       </section>
 
       <section className="arena-profile-section">
-        <div className="arena-profile-section__title"><strong>AI 用户库</strong><span>点击已有用户可编辑，开会时可直接选择</span></div>
+        <div className="arena-profile-section__title"><strong>{t("users.ai.user.library")}</strong><span>{t("users.select.an.existing.user.to.edit.it.then.choose")}</span></div>
         <div className="arena-ai-library">
           {profiles?.aiUsers.map(profile => (
             <div className={`arena-ai-card ${draft.id === profile.id ? 'is-active' : ''}`} key={profile.id}>
@@ -946,22 +956,22 @@ function ProfilesView(props: {
                 <Avatar value={profile.avatar} name={profile.name} className="arena-avatar--medium" />
                 <span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span>
               </button>
-              <button className="arena-ai-delete" type="button" aria-label={`删除 ${profile.name}`} onClick={() => void deleteAi(profile)}>×</button>
+              <button className="arena-ai-delete" type="button" aria-label={t("users.delete.value", { p0: profile.name })} onClick={() => void deleteAi(profile)}>×</button>
             </div>
           ))}
-          <button className="arena-ai-add" type="button" onClick={resetDraft}>＋ 创建新 AI 用户</button>
+          <button className="arena-ai-add" type="button" onClick={resetDraft}>{t("users.create.ai.user")}</button>
         </div>
 
         <div className="arena-ai-editor">
           <AvatarEditor value={draft.avatar} name={draft.name || 'AI'} onChange={avatar => setDraft(current => ({ ...current, avatar }))} />
           <div className="arena-ai-form">
-            <label className={`arena-field ${profileErrors.name ? 'has-error' : ''}`}><span>显示名称 <b>必填</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.name)} value={draft.name} maxLength={24} placeholder="例如：毒舌产品经理" onChange={event => { setDraft(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, name: '' })); setMessage('') }} />{profileErrors.name ? <small className="arena-field-error">{profileErrors.name}</small> : null}</label>
-            <label className="arena-field"><span>自定义人格 <em>选填，最多 16000 字</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder="可留空；支持导入含 {{user}}、{{char}} 的人格卡" onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
-             <label className="arena-field"><span>预设快捷对话（每行一条，最多 8 条）</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={'帮我分析这个想法\n用你的风格吐槽一下\n给我三个行动建议'} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
-            <label className="arena-toggle arena-toggle--ai-reply"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>关闭此 AI 的自动接话判断</strong><small>仍可自动接话，但不再自行判断是否接话，改由管理员统一分配。<br />关闭此功能可节省 Token。</small></span></label>
+            <label className={`arena-field ${profileErrors.name ? 'has-error' : ''}`}><span>{t("users.display.name")} <b>{t("users.required")}</b></span><input className="arena-input" aria-invalid={Boolean(profileErrors.name)} value={draft.name} maxLength={24} placeholder={t("users.for.example.a.blunt.product.manager")} onChange={event => { setDraft(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, name: '' })); setMessage('') }} />{profileErrors.name ? <small className="arena-field-error">{errorText(profileErrors.name)}</small> : null}</label>
+            <label className="arena-field"><span>{t("users.custom.persona")} <em>{t("users.optional.up.to.16.000.characters")}</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder={t("users.optional.persona.cards.with.user.and.char.placeholders.are")} onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
+             <label className="arena-field"><span>{t("users.quick.conversation.starters.one.per.line.up.to.8")}</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={t("users.help.me.analyze.this.idea.roast.it.in.your")} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
+            <label className="arena-toggle arena-toggle--ai-reply"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>{t("users.disable.this.ai.s.independent.follow.up.check")}</strong><small>{t("users.this.ai.can.still.reply.automatically.but.the.administrator")}<br />{t("users.disabling.this.check.can.save.tokens")}</small></span></label>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.provider ? 'has-error' : ''}`}>
-                <span>供应商 <b>必填</b></span>
+                <span>{t("users.provider")} <b>{t("users.required")}</b></span>
                 <select className="arena-select" value={draft.provider ?? ''} onChange={event => {
                   const provider = event.target.value
                   const firstModel = modelCatalog.find(item => item.id === provider)?.models[0]?.id || ''
@@ -969,29 +979,29 @@ function ProfilesView(props: {
                   setProfileErrors(current => ({ ...current, provider: '', model: '' }))
                   setMessage('')
                 }}>
-                  {!modelCatalog.length ? <option value="">暂无可用供应商</option> : null}
+                  {!modelCatalog.length ? <option value="">{t("users.no.providers.available")}</option> : null}
                   {modelCatalog.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}
                 </select>
-                {profileErrors.provider ? <small className="arena-field-error">{profileErrors.provider}</small> : null}
+                {profileErrors.provider ? <small className="arena-field-error">{errorText(profileErrors.provider)}</small> : null}
               </label>
               <label className={`arena-field ${profileErrors.model ? 'has-error' : ''}`}>
-                <span>模型 <b>必填</b></span>
+                <span>{t("users.model")} <b>{t("users.required")}</b></span>
                 <select className="arena-select" value={draft.model ?? ''} onChange={event => { setDraft(current => ({ ...current, model: event.target.value })); setProfileErrors(current => ({ ...current, model: '' })); setMessage('') }}>
-                  {!providerEntry?.models.length ? <option value="">暂无可用模型</option> : null}
+                  {!providerEntry?.models.length ? <option value="">{t("users.no.models.available")}</option> : null}
                   {(providerEntry?.models ?? []).map(model => <option key={model.id} value={model.id}>{model.name}</option>)}
                 </select>
-                {profileErrors.model ? <small className="arena-field-error">{profileErrors.model}</small> : null}
+                {profileErrors.model ? <small className="arena-field-error">{errorText(profileErrors.model)}</small> : null}
               </label>
-              <label className="arena-color-field"><span>主题色</span><input type="color" value={draft.color ?? '#6f5ee8'} onChange={event => setDraft(current => ({ ...current, color: event.target.value }))} /></label>
+              <label className="arena-color-field"><span>{t("users.accent.color")}</span><input type="color" value={draft.color ?? '#6f5ee8'} onChange={event => setDraft(current => ({ ...current, color: event.target.value }))} /></label>
             </div>
-            {!modelCatalog.length ? <div className="arena-error">DSH 暂未报告已启用的模型供应商，请先在 DSH 设置中配置模型。</div> : null}
+            {!modelCatalog.length ? <div className="arena-error">{t("users.dsh.has.not.reported.any.enabled.model.providers.configure")}</div> : null}
           </div>
         </div>
       </section>
       </div>
       <div className="arena-action-dock">
-        <span className="arena-action-dock__message" data-error={Object.values(profileErrors).some(Boolean)}>{Object.values(profileErrors).some(Boolean) ? (profileErrors.form || message || '请补全标红的必填项。') : (message || (draft.id ? `正在编辑 ${draft.name || '这个 AI 用户'}。` : '名称、供应商和模型填写完整后即可创建；人格可以留空。'))}</span>
-        <button className="arena-launch" type="button" disabled={savingAi} onClick={() => void saveAi()}>{savingAi ? '保存中…' : draft.id ? '保存 AI 用户修改' : '创建 AI 用户'}</button>
+        <span className="arena-action-dock__message" data-error={Object.values(profileErrors).some(Boolean)}>{errorText(Object.values(profileErrors).some(Boolean) ? (profileErrors.form || message || t("users.complete.the.required.fields.highlighted.in.red")) : (message || (draft.id ? t("users.editing.value", { p0: draft.name || t("users.this.ai.user") }) : t("users.enter.a.name.provider.and.model.to.create.the"))))}</span>
+        <button className="arena-launch" type="button" disabled={savingAi} onClick={() => void saveAi()}>{savingAi ? t("users.saving") : draft.id ? t("users.save.ai.user.changes") : t("users.create.ai.user.2")}</button>
       </div>
     </div>
   )
@@ -1001,14 +1011,14 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
   const [settings, setSettings] = useState<ArenaSettings>(props.settings ?? { ...DEFAULT_ARENA_SETTINGS })
   const [statusDraft, setStatusDraft] = useState('')
   const [saving, setSaving] = useState(false)
-  const [message, setMessage] = useState('')
+  const [message, setMessage] = useState<UiNotice>('')
   useEffect(() => {
     if (props.settings) setSettings(props.settings)
   }, [props.settings?.rateLimitCooldownEnabled, props.settings?.channelQueueEnabled, props.settings?.channelRequestsPerMinute, props.settings?.cooldownErrorStatuses?.join(','), props.settings?.autoReplyEnabled])
   const addStatus = (): void => {
     const status = Number(statusDraft)
     if (!Number.isInteger(status) || status < 100 || status > 599) {
-      setMessage('请输入 100–599 之间的 HTTP 错误码。')
+      setMessage(notice("settings.enter.an.http.status.code.between.100.and.599"))
       return
     }
     setSettings(current => current.cooldownErrorStatuses.includes(status)
@@ -1021,29 +1031,29 @@ function CollaborationSettingsView(props: { settings?: ArenaSettings; onSaved: (
     setSaving(true); setMessage('')
     try {
       const result = await jsonRequest<{ settings: ArenaSettings }>('/settings', { method: 'PATCH', body: JSON.stringify(settings) })
-      setSettings(result.settings); props.onSaved(result.settings); setMessage('协作行为设置已保存。')
-    } catch (cause) { setMessage(cause instanceof Error ? cause.message : String(cause)) }
+      setSettings(result.settings); props.onSaved(result.settings); setMessage(notice("settings.collaboration.settings.saved"))
+    } catch (cause) { setMessage(captureError(cause)) }
     finally { setSaving(false) }
   }
-  return <div className="arena-profiles"><div className="arena-page-scroll"><div className="arena-kicker">Collaboration behavior</div><h2>协作行为设置</h2><p className="arena-lead">统一配置 Arena 中所有模型请求的共享渠道保护策略。</p>{message ? <div className="arena-page-alert is-success" role="status">{message}</div> : null}
-    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>渠道保护</strong><span>按供应商配置共享计算</span></div>
-      <label className="arena-toggle"><input type="checkbox" checked={settings.rateLimitCooldownEnabled} onChange={event => setSettings(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>渠道限流冷却</strong><small>同一供应商配置触发限流后，所有共享角色一起等待；失败请求也计入渠道次数。</small></span></label>
+  return <div className="arena-profiles"><div className="arena-page-scroll"><div className="arena-kicker">{t("settings.collaboration.settings")}</div><h2>{t("settings.collaboration.settings")}</h2><p className="arena-lead">{t("settings.configure.shared.channel.protection.for.all.model.requests.in")}</p>{message ? <div className="arena-page-alert is-success" role="status">{errorText(message)}</div> : null}
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>{t("settings.channel.protection")}</strong><span>{t("settings.shared.by.provider.configuration")}</span></div>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.rateLimitCooldownEnabled} onChange={event => setSettings(current => ({ ...current, rateLimitCooldownEnabled: event.target.checked }))} /><span><strong>{t("settings.rate.limit.cooldown")}</strong><small>{t("settings.when.a.provider.configuration.hits.a.rate.limit.all")}</small></span></label>
       <div className="arena-setting-control">
-        <div><strong>触发冷却的错误码</strong><small>默认 429、500；删除某个错误码后，该状态码将不再触发渠道冷却。</small></div>
+        <div><strong>{t("settings.status.codes.that.trigger.cooldown")}</strong><small>{t("settings.defaults.429.and.500.removing.a.code.means.that")}</small></div>
         <div className="arena-status-editor">
-          <div className="arena-status-chips">{settings.cooldownErrorStatuses.length ? settings.cooldownErrorStatuses.map(status => <span key={status}>{status}<button type="button" aria-label={`删除错误码 ${status}`} onClick={() => setSettings(current => ({ ...current, cooldownErrorStatuses: current.cooldownErrorStatuses.filter(item => item !== status) }))}>×</button></span>) : <em>未配置错误码</em>}</div>
-          <div className="arena-status-add"><input className="arena-input" type="number" min={100} max={599} placeholder="例如 503" value={statusDraft} onChange={event => setStatusDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addStatus() } }} /><button className="arena-control" type="button" onClick={addStatus}>添加</button></div>
+          <div className="arena-status-chips">{settings.cooldownErrorStatuses.length ? settings.cooldownErrorStatuses.map(status => <span key={status}>{status}<button type="button" aria-label={t("settings.remove.status.code.value", { p0: status })} onClick={() => setSettings(current => ({ ...current, cooldownErrorStatuses: current.cooldownErrorStatuses.filter(item => item !== status) }))}>×</button></span>) : <em>{t("settings.no.status.codes.configured")}</em>}</div>
+          <div className="arena-status-add"><input className="arena-input" type="number" min={100} max={599} placeholder={t("settings.for.example.503")} value={statusDraft} onChange={event => setStatusDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); addStatus() } }} /><button className="arena-control" type="button" onClick={addStatus}>{t("settings.add")}</button></div>
         </div>
       </div>
-      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>同渠道请求队列</strong><small>同一供应商下的正式发言、工具续跑、子 Agent 和接话判断统一排队；回复速度可能降低。</small></span></label>
-      <label className="arena-setting-control arena-setting-control--inline"><span><strong>每分钟放行次数</strong><small>作用于每个供应商共享队列，可填写 1–10000；保存后从下一次请求开始生效。</small></span><input className="arena-input" type="number" min={1} max={10000} value={settings.channelRequestsPerMinute} onChange={event => setSettings(current => ({ ...current, channelRequestsPerMinute: Number(event.target.value) }))} /></label>
-      <details className="arena-setting-help"><summary>为什么按供应商配置计算？</summary><p>Arena 不读取或保存 DSH 中的 API Key，无法按密钥精确分组，因此将同一供应商配置下的不同模型视为共享渠道。</p></details>
+      <label className="arena-toggle"><input type="checkbox" checked={settings.channelQueueEnabled} onChange={event => setSettings(current => ({ ...current, channelQueueEnabled: event.target.checked }))} /><span><strong>{t("settings.shared.channel.request.queue")}</strong><small>{t("settings.replies.tool.continuations.subagents.and.follow.up.checks.using")}</small></span></label>
+      <label className="arena-setting-control arena-setting-control--inline"><span><strong>{t("settings.requests.allowed.per.minute")}</strong><small>{t("settings.applies.to.each.shared.provider.queue.enter.1.10")}</small></span><input className="arena-input" type="number" min={1} max={10000} value={settings.channelRequestsPerMinute} onChange={event => setSettings(current => ({ ...current, channelRequestsPerMinute: Number(event.target.value) }))} /></label>
+      <details className="arena-setting-help"><summary>{t("settings.why.group.by.provider.configuration")}</summary><p>{t("settings.arena.does.not.read.or.store.api.keys.from")}</p></details>
     </section>
-    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>说明</strong><span>自动接话设置位于用户中心的群管理员面板</span></div>
+    <section className="arena-profile-section"><div className="arena-profile-section__title"><strong>{t("settings.note")}</strong><span>{t("settings.automatic.reply.settings.are.in.users.group.administrator")}</span></div>
 
 
 
-    </section><button className="arena-launch" type="button" disabled={saving} onClick={() => void save()}>{saving ? '保存中…' : '保存协作行为设置'}</button>
+    </section><button className="arena-launch" type="button" disabled={saving} onClick={() => void save()}>{saving ? t("users.saving") : t("settings.save.collaboration.settings")}</button>
   </div></div>
 }
 
@@ -1058,7 +1068,7 @@ function CreateChatView(props: {
   const [name, setName] = useState('')
   const [selected, setSelected] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<UiNotice>('')
 
   useEffect(() => { setType(initialType); setSelected([]); setError('') }, [initialType])
 
@@ -1075,7 +1085,7 @@ function CreateChatView(props: {
 
   const create = async (): Promise<void> => {
     if ((type === 'direct' && selected.length !== 1) || (type === 'group' && selected.length < 2)) {
-      setError(type === 'direct' ? '请选择 1 位 AI 用户。' : '群聊请选择 2–12 位 AI 用户。')
+      setError(type === 'direct' ? notice("chat.please.select.1.ai.user") : notice("chat.select.2.12.ai.users.for.a.group.chat"))
       return
     }
     setBusy(true)
@@ -1085,52 +1095,52 @@ function CreateChatView(props: {
       })
       onCreated(result.room)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusy(false) }
   }
 
   return (
     <div className="arena-chat-create">
       <div className="arena-page-scroll">
-      <div className="arena-kicker">Social chat</div>
-      <h2>{type === 'direct' ? '发起私聊' : '创建群聊'}</h2>
-      <p className="arena-lead">从 AI 用户库中选择聊天对象。群聊会自动加入管理员；发送消息时可用 @ 精确点名某个 AI。</p>
-      {error ? <div className="arena-page-alert" role="alert">{error}</div> : null}
+      <div className="arena-kicker">{t("chat.socialChat")}</div>
+      <h2>{type === 'direct' ? t("chat.start.a.direct.chat") : t("chat.create.group.chat")}</h2>
+      <p className="arena-lead">{t("chat.choose.people.from.the.ai.user.library.group.chats")}</p>
+      {error ? <div className="arena-page-alert" role="alert">{errorText(error)}</div> : null}
       <div className="arena-chat-type-tabs">
-        <button className={type === 'direct' ? 'is-active' : ''} type="button" onClick={() => { setType('direct'); setSelected([]); setError('') }}>💬 一对一私聊</button>
-        <button className={type === 'group' ? 'is-active' : ''} type="button" onClick={() => { setType('group'); setSelected([]); setError('') }}>👥 多 AI 群聊</button>
+        <button className={type === 'direct' ? 'is-active' : ''} type="button" onClick={() => { setType('direct'); setSelected([]); setError('') }}>{t("chat.direct.chat")}</button>
+        <button className={type === 'group' ? 'is-active' : ''} type="button" onClick={() => { setType('group'); setSelected([]); setError('') }}>{t("chat.multi.ai.group.chat")}</button>
       </div>
       {type === 'group' ? (
-        <label className="arena-field"><span>群聊名称（可选）</span><input className="arena-input" value={name} maxLength={60} placeholder="例如：周五灵感局" onChange={event => setName(event.target.value)} /></label>
+        <label className="arena-field"><span>{t("chat.group.name.optional")}</span><input className="arena-input" value={name} maxLength={60} placeholder={t("chat.for.example.friday.brainstorming")} onChange={event => setName(event.target.value)} /></label>
       ) : null}
-      <span className={`arena-section-title ${error ? 'has-error' : ''}`}>选择 AI 用户 · 已选 {selected.length}/{type === 'direct' ? 1 : 12}</span>
+      <span className={`arena-section-title ${error ? 'has-error' : ''}`}>{t("counts.selectedUsers", { count: `${selected.length}/${type === 'direct' ? 1 : 12}` })}</span>
       {profiles?.aiUsers.length ? (
         <div className="arena-chat-user-grid">
           {profiles.aiUsers.map(profile => (
             <button type="button" key={profile.id} className={`arena-chat-user ${selected.includes(profile.id) ? 'is-active' : ''}`} onClick={() => toggle(profile.id)}>
               <Avatar value={profile.avatar} name={profile.name} className="arena-avatar--medium" />
-              <span><strong>{profile.name}</strong><small>{profile.role || '通用助手（未设置人格）'}</small><em>{profile.provider}/{profile.model}</em></span>
+              <span><strong>{profile.name}</strong><small>{profile.role || t("chat.general.assistant.no.custom.persona")}</small><em>{profile.provider}/{profile.model}</em></span>
               <i>{selected.includes(profile.id) ? '✓' : '+'}</i>
             </button>
           ))}
         </div>
       ) : (
-        <button className="arena-empty-users" type="button" onClick={onManageProfiles}>需要先创建 AI 用户 →</button>
+        <button className="arena-empty-users" type="button" onClick={onManageProfiles}>{t("chat.create.an.ai.user.first")}</button>
       )}
       </div>
       <div className="arena-action-dock">
-        <span className="arena-action-dock__message" data-error={Boolean(error)}>{error || (type === 'direct' ? '选择 1 位 AI，即可开始一对一私聊。' : '选择 2–12 位 AI，即可创建群聊，之后还可以继续邀请。')}</span>
-        <button className="arena-launch" type="button" disabled={busy} onClick={() => void create()}>{busy ? '创建中…' : type === 'direct' ? '开始私聊' : '创建群聊'}</button>
+        <span className="arena-action-dock__message" data-error={Boolean(error)}>{error || (type === 'direct' ? t("chat.select.1.ai.user.to.start.a.direct.chat") : t("chat.select.2.12.ai.users.to.create.a.group"))}</span>
+        <button className="arena-launch" type="button" disabled={busy} onClick={() => void create()}>{busy ? t("chat.creating") : type === 'direct' ? t("chat.start.direct.chat") : t("chat.create.group.chat")}</button>
       </div>
     </div>
   )
 }
 
-const ROLE_ACTIVITY_TEXT: Record<string, string> = {
-  idle: '空闲', acknowledging: '确认消息', thinking: '思考中', working: '工作中', tool: '使用工具',
-  editing: '编辑文件', testing: '测试中', researching: '查阅中', delegating: '调度子 Agent', waiting: '等待协作',
-  error: '发生错误', muted: '已静默',
-}
+function ROLE_ACTIVITY_TEXT(): Record<string, string> { return {
+  idle: t("role_activity.idle"), acknowledging: t("role_activity.acknowledging"), thinking: t("activity.thinking"), working: t("role_activity.working"), tool: t("role_activity.using.tools"),
+  editing: t("role_activity.editing.files"), testing: t("role_activity.testing"), researching: t("role_activity.researching"), delegating: t("role_activity.delegating.to.subagents"), waiting: t("role_activity.waiting.for.collaboration"),
+  error: t("role_activity.error"), muted: t("role_activity.muted"),
+} }
 
 const ACTIVE_ROLE_ACTIVITY = new Set(['acknowledging', 'thinking', 'working', 'tool', 'editing', 'testing', 'researching', 'delegating', 'waiting'])
 
@@ -1141,7 +1151,7 @@ function compactFilePath(value: string): string {
 
 function activityTime(value: string): string {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
 function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<string, string>; onPermission?: (profileId: string, mode: string) => Promise<void> }): ReactNode {
@@ -1151,7 +1161,7 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
   const [historyRole, setHistoryRole] = useState<RoleActivity | null>(null)
   const [permissionDrafts, setPermissionDrafts] = useState<Record<string, string>>({})
   const [permissionBusy, setPermissionBusy] = useState<Record<string, boolean>>({})
-  const [permissionErrors, setPermissionErrors] = useState<Record<string, string>>({})
+  const [permissionErrors, setPermissionErrors] = useState<Record<string, UiNotice>>({})
 
   useEffect(() => {
     setExpanded(current => {
@@ -1193,7 +1203,7 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
       await onPermission(profileId, mode)
     } catch (cause) {
       setPermissionDrafts(current => { const next = { ...current }; delete next[profileId]; return next })
-      setPermissionErrors(current => ({ ...current, [profileId]: cause instanceof Error ? cause.message : String(cause) }))
+      setPermissionErrors(current => ({ ...current, [profileId]: captureError(cause) }))
     } finally {
       setPermissionBusy(current => ({ ...current, [profileId]: false }))
     }
@@ -1205,8 +1215,8 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
   return (
     <section className="arena-role-monitor">
       <div className="arena-role-monitor__head">
-        <div><h3>角色动态</h3><p>实时协作板 · 角色之间可互相查看</p></div>
-        <span data-active={activeCount > 0} data-error={errorCount > 0}>{errorCount ? `${errorCount} 个错误` : activeCount ? `${activeCount} 工作中` : '均空闲'}</span>
+        <div><h3>{t("activity.role.activity")}</h3><p>{t("activity.live.collaboration.board.visible.to.other.roles")}</p></div>
+        <span data-active={activeCount > 0} data-error={errorCount > 0}>{errorCount ? t("activity.value.errors", { p0: errorCount }) : activeCount ? t("activity.value.working", { p0: activeCount }) : t("activity.all.idle")}</span>
       </div>
       <div className="arena-role-monitor__list">
         {roles.map(role => {
@@ -1216,32 +1226,32 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
               <div className="arena-role-activity__row">
                 <button className="arena-role-activity__toggle" type="button" aria-expanded={isOpen} onClick={() => setExpanded(current => ({ ...current, [role.profileId]: !isOpen }))}>
                   <Avatar value={role.avatar} name={role.name} />
-                  <span><strong>{role.name}</strong><small>{role.stage || ROLE_ACTIVITY_TEXT[role.status] || role.status}</small></span>
-                  <i className="arena-role-activity__status"><b />{ROLE_ACTIVITY_TEXT[role.status] || role.status}</i>
+                  <span><strong>{role.name}</strong><small>{systemText(role.stage, role.stageI18n) || ROLE_ACTIVITY_TEXT()[role.status] || role.status}</small></span>
+                  <i className="arena-role-activity__status"><b />{ROLE_ACTIVITY_TEXT()[role.status] || role.status}</i>
                   <em>{isOpen ? '−' : '+'}</em>
                 </button>
-                {onPermission ? <div className="arena-role-activity__permission-wrap"><select className="arena-role-activity__permission" aria-label={`${role.name} 的 Agent 权限`} disabled={permissionBusy[role.profileId] === true} value={permissionDrafts[role.profileId] ?? permissions?.[role.profileId] ?? 'danger-full-access'} onChange={event => void changePermission(role.profileId, event.target.value)}><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option><option value="danger-full-access">Full access</option></select>{permissionBusy[role.profileId] ? <small>保存中…</small> : permissionErrors[role.profileId] ? <small className="is-error" title={permissionErrors[role.profileId]}>设置失败</small> : null}</div> : null}
+                {onPermission ? <div className="arena-role-activity__permission-wrap"><select className="arena-role-activity__permission" aria-label={t("activity.value.s.agent.permissions", { p0: role.name })} disabled={permissionBusy[role.profileId] === true} value={permissionDrafts[role.profileId] ?? permissions?.[role.profileId] ?? 'danger-full-access'} onChange={event => void changePermission(role.profileId, event.target.value)}><option value="read-only">{t("permissions.readOnly")}</option><option value="workspace-write">{t("permissions.workspaceWrite")}</option><option value="danger-full-access">{t("permissions.fullAccess")}</option></select>{permissionBusy[role.profileId] ? <small>{t("users.saving")}</small> : permissionErrors[role.profileId] ? <small className="is-error" title={errorText(permissionErrors[role.profileId])}>{t("activity.save.failed")}</small> : null}</div> : null}
               </div>
               {isOpen ? (
                 <div className="arena-role-activity__body">
-                  {role.detail ? <p>{role.detail}</p> : <p className="is-muted">暂无更多细节。</p>}
-                  {role.currentTool ? <div className="arena-role-tool"><span>当前工具</span><code>{role.currentTool}</code></div> : null}
-                  {role.claimedFiles.length ? <div className="arena-role-files"><span>已锁定文件</span>{role.claimedFiles.map(file => <code key={file} title={file}>🔒 {compactFilePath(file)}</code>)}</div> : null}
-                  {role.recent.length ? <div className="arena-role-events"><span>最近动作</span>{[...role.recent].reverse().slice(0, 6).map(event => <div data-kind={event.kind} key={event.id}><i /><p>{event.text}</p><time>{activityTime(event.createdAt)}</time></div>)}</div> : null}
-                  <button className="arena-role-history-button" type="button" onClick={() => setHistoryRole(role)}>查看动作记录{role.history?.length ? `（${role.history.length}）` : ''}</button>
-                  <div className="arena-role-updated">最后更新 {activityTime(role.updatedAt)}</div>
+                  {role.detail ? <p>{role.detailI18n ? systemText(role.detail, role.detailI18n) : role.detail}</p> : <p className="is-muted">{t("activity.no.further.details")}</p>}
+                  {role.currentTool ? <div className="arena-role-tool"><span>{t("activity.current.tool")}</span><code>{systemText(role.currentTool, role.currentToolI18n)}</code></div> : null}
+                  {role.claimedFiles.length ? <div className="arena-role-files"><span>{t("activity.locked.files")}</span>{role.claimedFiles.map(file => <code key={file} title={file}>🔒 {compactFilePath(file)}</code>)}</div> : null}
+                  {role.recent.length ? <div className="arena-role-events"><span>{t("activity.recent.actions")}</span>{[...role.recent].reverse().slice(0, 6).map(event => <div data-kind={event.kind} key={event.id}><i /><p>{systemText(event.text, event.i18n)}</p><time>{activityTime(event.createdAt)}</time></div>)}</div> : null}
+                  <button className="arena-role-history-button" type="button" onClick={() => setHistoryRole(role)}>{t("activity.view.action.history")}{role.history?.length ? `（${role.history.length}）` : ''}</button>
+                  <div className="arena-role-updated">{t("activity.last.updated")} {activityTime(role.updatedAt)}</div>
                 </div>
               ) : null}
             </article>
           )
         })}
-        {!roles.length ? <div className="arena-role-monitor__empty">尚无角色运行数据。</div> : null}
+        {!roles.length ? <div className="arena-role-monitor__empty">{t("activity.no.role.activity.yet")}</div> : null}
       </div>
-      <div className="arena-role-monitor__note">文件编辑采用角色锁；冲突文件会在工具执行前被阻止。</div>
+      <div className="arena-role-monitor__note">{t("activity.file.edits.use.per.role.locks.conflicting.edits.are")}</div>
       {historyRole ? <div className="arena-dialog-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) setHistoryRole(null) }}>
-        <section className="arena-dialog arena-role-history-dialog" role="dialog" aria-modal="true" aria-label={`${historyRole.name} 的动作记录`}>
-          <header><div><strong>{historyRole.name} · 动作记录</strong><span>完整保留，不再用新动作覆盖旧记录</span></div><button type="button" onClick={() => setHistoryRole(null)}>×</button></header>
-          <div className="arena-role-history-list">{[...(historyRole.history ?? historyRole.recent)].reverse().map(event => <div data-kind={event.kind} key={event.id}><i /><p>{event.text}</p><time>{activityTime(event.createdAt)}</time></div>)}{!(historyRole.history ?? historyRole.recent).length ? <p className="is-muted">暂无动作记录。</p> : null}</div>
+        <section className="arena-dialog arena-role-history-dialog" role="dialog" aria-modal="true" aria-label={t("activity.value.s.action.history", { p0: historyRole.name })}>
+          <header><div><strong>{historyRole.name} {t("activity.action.history")}</strong><span>{t("activity.earlier.actions.are.retained.instead.of.being.replaced.by")}</span></div><button type="button" onClick={() => setHistoryRole(null)}>×</button></header>
+          <div className="arena-role-history-list">{[...(historyRole.history ?? historyRole.recent)].reverse().map(event => <div data-kind={event.kind} key={event.id}><i /><p>{systemText(event.text, event.i18n)}</p><time>{activityTime(event.createdAt)}</time></div>)}{!(historyRole.history ?? historyRole.recent).length ? <p className="is-muted">{t("activity.no.recorded.actions")}</p> : null}</div>
         </section>
       </div> : null}
     </section>
@@ -1259,11 +1269,52 @@ function ApprovalCard(props: { approval?: ApprovalRequest; onResolve: (outcome: 
     try { await onResolve(outcome, withNote ? note.trim() : undefined) } finally { setBusy(false) }
   }
   return <div className="arena-approval-card" data-status={approval.status}>
-    <div className="arena-approval-card__title">🛡️ 权限审计 {pending ? '· 等待你的决定' : `· ${approval.status === 'approved' ? '已允许一次' : approval.status === 'rejected' ? '已拒绝' : '已取消'}`}</div>
+    <div className="arena-approval-card__title">{t("approval.permission.review")} {pending ? t("approval.awaiting.your.decision") : `· ${approval.status === 'approved' ? t("approval.allowed.once") : approval.status === 'rejected' ? t("approval.rejected") : t("approval.canceled")}`}</div>
     {pending ? <>
-      <div className="arena-approval-card__actions"><button type="button" disabled={busy} onClick={() => void resolve('allowed-once')}>允许一次</button><button type="button" disabled={busy} onClick={() => void resolve('rejected')}>拒绝</button></div>
-      <div className="arena-approval-card__manual"><input className="arena-input" value={note} maxLength={2000} placeholder="也可以输入备注或执行要求" onChange={event => setNote(event.target.value)} /><button type="button" disabled={busy || !note.trim()} onClick={() => void resolve('allowed-once', true)}>允许并附加说明</button></div>
+      <div className="arena-approval-card__actions"><button type="button" disabled={busy} onClick={() => void resolve('allowed-once')}>{t("approval.allow.once")}</button><button type="button" disabled={busy} onClick={() => void resolve('rejected')}>{t("approval.reject")}</button></div>
+      <div className="arena-approval-card__manual"><input className="arena-input" value={note} maxLength={2000} placeholder={t("approval.optionally.enter.a.note.or.execution.requirements")} onChange={event => setNote(event.target.value)} /><button type="button" disabled={busy || !note.trim()} onClick={() => void resolve('allowed-once', true)}>{t("approval.allow.with.a.note")}</button></div>
     </> : approval.note ? <p>{approval.note}</p> : null}
+  </div>
+}
+
+function WorkdirSettings({ value = '', onSave }: { value?: string; onSave: (workdir: string) => Promise<string> }): ReactNode {
+  const [draft, setDraft] = useState(value)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<UiNotice>('')
+  const [savedValue, setSavedValue] = useState<string | null>(null)
+  const inFlight = useRef(false)
+
+  useEffect(() => { setDraft(value); setError('') }, [value])
+
+  const save = async (): Promise<void> => {
+    if (inFlight.current || draft.trim() === value) return
+    inFlight.current = true
+    setSaving(true)
+    setError('')
+    setSavedValue(null)
+    try {
+      const persistedValue = await onSave(draft.trim())
+      setSavedValue(persistedValue)
+    } catch (cause) {
+      setError(captureError(cause))
+    } finally {
+      inFlight.current = false
+      setSaving(false)
+    }
+  }
+
+  return <div className="arena-workdir-settings">
+    <label className="arena-field"><span>{t("workspace.working.directory")}</span>
+      <input className="arena-input" aria-label={t("workspace.working.directory")} value={draft} disabled={saving} placeholder={t("workspace.leave.blank.to.use.the.startup.directory")}
+        onChange={event => { setDraft(event.target.value); setSavedValue(null); setError('') }}
+        onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void save() } }} />
+    </label>
+    <div className="arena-workdir-actions">
+      <button className="arena-control arena-control--primary" type="button" disabled={saving || draft.trim() === value} onClick={() => void save()}>{saving ? t("users.saving") : t("workspace.save.working.directory")}</button>
+      {savedValue !== null && savedValue === value ? <span role="status">{t("workspace.saved")}</span> : null}
+    </div>
+    <small className="arena-field-hint">{t("workspace.use.an.existing.absolute.directory.changes.apply.to.the")}</small>
+    {error ? <div className="arena-error" role="alert">{errorText(error)}</div> : null}
   </div>
 }
 
@@ -1273,7 +1324,7 @@ function ChatView(props: {
   onSend: (text: string) => Promise<void>
   onRetry: () => Promise<void>
   onRename: (name: string) => Promise<void>
-  onSetWorkdir: (workdir: string) => Promise<void>
+  onSetWorkdir: (workdir: string) => Promise<string>
   onInvite: (profileIds: string[]) => Promise<void>
   onDelete: () => Promise<void>
   onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void>
@@ -1282,13 +1333,12 @@ function ChatView(props: {
   const { room, profiles, onSend, onRetry, onRename, onSetWorkdir, onInvite, onDelete, onApproval, onPermission } = props
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<UiNotice>('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [roomName, setRoomName] = useState(room.name)
-  const [roomWorkdir, setRoomWorkdir] = useState(room.workdir ?? '')
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [settingsBusy, setSettingsBusy] = useState(false)
-  const [settingsError, setSettingsError] = useState('')
+  const [settingsError, setSettingsError] = useState<UiNotice>('')
   const [monitorWidth, setMonitorWidth] = useState(310)
   const scrollRef = useRef<HTMLDivElement>(null)
   const chatLayoutRef = useRef<HTMLDivElement>(null)
@@ -1301,7 +1351,6 @@ function ChatView(props: {
   const availableInvitees = (profiles?.aiUsers ?? []).filter(profile => !room.participants.some(item => item.id === profile.id))
 
   useEffect(() => { setRoomName(room.name) }, [room.name])
-  useEffect(() => { setRoomWorkdir(room.workdir ?? '') }, [room.id, room.workdir])
 
   useEffect(() => {
     const element = scrollRef.current
@@ -1317,7 +1366,7 @@ function ChatView(props: {
       await onSend(content)
       setText('')
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusy(false) }
   }
 
@@ -1328,40 +1377,28 @@ function ChatView(props: {
     try {
       await onRetry()
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusy(false) }
   }
 
   const saveRoomName = async (): Promise<void> => {
-    if (!roomName.trim()) { setSettingsError('聊天名称不能为空。'); return }
+    if (!roomName.trim()) { setSettingsError(notice("chat.the.chat.name.cannot.be.empty")); return }
     setSettingsBusy(true)
     setSettingsError('')
     try { await onRename(roomName.trim()) } catch (cause) {
-      setSettingsError(cause instanceof Error ? cause.message : String(cause))
+      setSettingsError(captureError(cause))
     } finally { setSettingsBusy(false) }
   }
 
-  const saveRoomWorkdir = async (): Promise<void> => {
-    setSettingsBusy(true)
-    setSettingsError('')
-    try {
-      await onSetWorkdir(roomWorkdir.trim())
-    } catch (cause) {
-      setSettingsError(cause instanceof Error ? cause.message : String(cause))
-    } finally {
-      setSettingsBusy(false)
-    }
-  }
-
   const inviteMembers = async (): Promise<void> => {
-    if (!inviteIds.length) { setSettingsError('请至少选择一位要邀请的 AI 用户。'); return }
+    if (!inviteIds.length) { setSettingsError(notice("chat.select.at.least.one.ai.user.to.invite")); return }
     setSettingsBusy(true)
     setSettingsError('')
     try {
       await onInvite(inviteIds)
       setInviteIds([])
     } catch (cause) {
-      setSettingsError(cause instanceof Error ? cause.message : String(cause))
+      setSettingsError(captureError(cause))
     } finally { setSettingsBusy(false) }
   }
 
@@ -1385,51 +1422,51 @@ function ChatView(props: {
           {room.administratorProfile ? <span style={{ zIndex: 6 }}><Avatar value={room.administratorProfile.avatar} name={room.administratorProfile.name} /></span> : null}
           {room.participants.slice(0, 4).map((profile, index) => <span style={{ zIndex: 4 - index }} key={profile.id}><Avatar value={profile.avatar} name={profile.name} /></span>)}
         </div>
-        <div><strong>{room.name}</strong><span>{room.type === 'direct' ? '私聊' : `${room.participants.length} 个 AI + 管理员`}</span></div>
-        <div className="arena-chat-head__actions"><button className="arena-control" type="button" onClick={() => { setSettingsOpen(current => !current); setSettingsError('') }}>{settingsOpen ? '关闭设置' : room.type === 'group' ? '群设置' : '聊天设置'}</button><button className="arena-control arena-control--danger" type="button" onClick={() => { if (window.confirm(room.type === 'group' ? `解散群聊“${room.name}”？全部群聊记录将被删除。` : `删除聊天“${room.name}”？`)) void onDelete() }}>{room.type === 'group' ? '解散群聊' : '删除聊天'}</button></div>
+        <div><strong>{room.name}</strong><span>{room.type === 'direct' ? t("chat.direct.chat.2") : t("chat.value.ai.users.administrator", { p0: room.participants.length })}</span></div>
+        <div className="arena-chat-head__actions"><button className="arena-control" type="button" onClick={() => { setSettingsOpen(current => !current); setSettingsError('') }}>{settingsOpen ? t("chat.close.settings") : room.type === 'group' ? t("chat.group.settings") : t("chat.chat.settings")}</button><button className="arena-control arena-control--danger" type="button" onClick={() => { if (window.confirm(room.type === 'group' ? t("chat.dissolve.group.value.all.messages.in.this.group.will", { p0: room.name }) : t("chat.delete.chat.value", { p0: room.name }))) void onDelete() }}>{room.type === 'group' ? t("chat.dissolve.group") : t("chat.delete.chat")}</button></div>
       </header>
       {settingsOpen ? (
-        <aside className="arena-chat-settings" aria-label={room.type === 'group' ? '群设置' : '聊天设置'}>
-          <div className="arena-chat-settings__head"><div><strong>{room.type === 'group' ? '群设置' : '聊天设置'}</strong><span>修改名称{room.type === 'group' ? '并邀请新的 AI 用户' : ''}</span></div><button type="button" aria-label="关闭设置" onClick={() => setSettingsOpen(false)}>×</button></div>
-          <label className="arena-field"><span>{room.type === 'group' ? '群聊名称' : '聊天名称'}</span><div className="arena-settings-name"><input className="arena-input" value={roomName} maxLength={80} onChange={event => setRoomName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomName() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomName.trim() === room.name} onClick={() => void saveRoomName()}>保存名称</button></div></label>
-          <label className="arena-field"><span>工作区目录</span><div className="arena-settings-name"><input className="arena-input" value={roomWorkdir} placeholder="留空 = 跟随 dsh web 启动目录；例如 D:\mine\项目名" onChange={event => setRoomWorkdir(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomWorkdir() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomWorkdir === (room.workdir ?? '')} onClick={() => void saveRoomWorkdir()}>保存工作区</button></div><small className="arena-field-hint">本群 AI 成员执行文件与命令的工作目录（绝对路径，需已存在）。修改后对新发起的角色工作生效。</small></label>
-          {room.type === 'group' ? <section><div className="arena-chat-settings__section"><strong>邀请 AI 用户</strong><span>当前 {room.participants.length}/12 位 AI</span></div>{availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : room.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">AI 用户库中没有可邀请的新成员。</div>}<button className="arena-launch arena-invite-submit" type="button" disabled={settingsBusy || !inviteIds.length} onClick={() => void inviteMembers()}>{settingsBusy ? '处理中…' : `邀请选中的 ${inviteIds.length || ''} 位成员`}</button></section> : null}
-          <section className="arena-permission-section"><div className="arena-chat-settings__section"><strong>本聊天的 Agent 权限</strong><span>每个对话单独生效；默认 Full access</span></div>{room.participants.map(profile => <label className="arena-permission-row" key={profile.id}><Avatar value={profile.avatar} name={profile.name} /><span>{profile.name}</span><select value={room.permissions?.[profile.id] || 'danger-full-access'} onChange={event => void onPermission(profile.id, event.target.value)}><option value="read-only">Read Only</option><option value="workspace-write">Workspace Write</option><option value="danger-full-access">Full access</option></select></label>)}</section>
-          {settingsError ? <div className="arena-error">{settingsError}</div> : null}
+        <aside className="arena-chat-settings" aria-label={room.type === 'group' ? t("chat.group.settings") : t("chat.chat.settings")}>
+          <div className="arena-chat-settings__head"><div><strong>{room.type === 'group' ? t("chat.group.settings") : t("chat.chat.settings")}</strong><span>{t(room.type === 'group' ? "chat.renameAndInvite" : "chat.rename")}</span></div><button type="button" aria-label={t("chat.close.settings")} onClick={() => setSettingsOpen(false)}>×</button></div>
+          <label className="arena-field"><span>{room.type === 'group' ? t("chat.group.name") : t("chat.chat.name")}</span><div className="arena-settings-name"><input className="arena-input" value={roomName} maxLength={80} onChange={event => setRoomName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveRoomName() }} /><button className="arena-control arena-control--primary" type="button" disabled={settingsBusy || roomName.trim() === room.name} onClick={() => void saveRoomName()}>{t("chat.save.name")}</button></div></label>
+          <WorkdirSettings key={room.id} value={room.workdir} onSave={onSetWorkdir} />
+          {room.type === 'group' ? <section><div className="arena-chat-settings__section"><strong>{t("chat.invite.ai.users")}</strong><span>{t("counts.inviteCapacity", { count: room.participants.length })}</span></div>{availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : room.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">{t("chat.there.are.no.more.ai.users.available.to.invite")}</div>}<button className="arena-launch arena-invite-submit" type="button" disabled={settingsBusy || !inviteIds.length} onClick={() => void inviteMembers()}>{settingsBusy ? t("chat.processing") : t("chat.invite.value.selected.members", { p0: inviteIds.length || '' })}</button></section> : null}
+          <section className="arena-permission-section"><div className="arena-chat-settings__section"><strong>{t("chat.agent.permissions.for.this.chat")}</strong><span>{t("chat.per.conversation.defaults.to.full.access")}</span></div>{room.participants.map(profile => <label className="arena-permission-row" key={profile.id}><Avatar value={profile.avatar} name={profile.name} /><span>{profile.name}</span><select value={room.permissions?.[profile.id] || 'danger-full-access'} onChange={event => void onPermission(profile.id, event.target.value)}><option value="read-only">{t("permissions.readOnly")}</option><option value="workspace-write">{t("permissions.workspaceWrite")}</option><option value="danger-full-access">{t("permissions.fullAccess")}</option></select></label>)}</section>
+          {settingsError ? <div className="arena-error">{errorText(settingsError)}</div> : null}
         </aside>
       ) : null}
       <div className="arena-chat-scroll" ref={scrollRef}>
         {room.messages.length === 0 ? (
           <div className="arena-chat-welcome">
             <div className="arena-chat-stack arena-chat-stack--large">{room.participants.map(profile => <span key={profile.id}><Avatar value={profile.avatar} name={profile.name} className="arena-avatar--large" /></span>)}</div>
-            <strong>{room.type === 'direct' ? `你和 ${room.participants[0]?.name} 的私聊` : room.name}</strong>
-            <span>发一条消息开始聊天，AI 会按自己的自定义人格回复。</span>
+            <strong>{room.type === 'direct' ? t("chat.your.direct.chat.with.value", { p0: room.participants[0]?.name }) : room.name}</strong>
+            <span>{t("chat.send.a.message.to.start.each.ai.will.reply")}</span>
           </div>
         ) : null}
         {room.messages.map(message => message.kind === 'system' ? (
-          <div className="arena-chat-system" key={message.id}>{message.text}{message.approval ? <ApprovalCard approval={message.approval} onResolve={(outcome, note) => onApproval(message.approval!.id, outcome, note)} /> : null}</div>
+          <div className="arena-chat-system" key={message.id}>{systemText(message.text, message.i18n)}{message.approval ? <ApprovalCard approval={message.approval} onResolve={(outcome, note) => onApproval(message.approval!.id, outcome, note)} /> : null}</div>
         ) : (
           <div className="arena-message-row" data-kind={message.kind === 'human' ? 'user' : message.kind === 'admin' ? 'admin' : 'participant'} key={message.id}>
             <Avatar value={message.avatar} name={message.senderName} className="arena-avatar--message" />
             <div className="arena-message" data-kind={message.kind === 'human' ? 'user' : message.kind === 'admin' ? 'admin' : 'participant'}>
-              <div className="arena-message__head"><strong>{message.senderName}</strong><span>{message.model ?? (message.kind === 'human' ? '你' : '')}{message.phase === 'ack' ? ' · 开始处理' : ''}</span></div>
+              <div className="arena-message__head"><strong>{message.senderName}</strong><span>{message.model ?? (message.kind === 'human' ? t("users.you") : '')}{message.phase === 'ack' ? t("chat.getting.started") : ''}</span></div>
               <div className="arena-message__text">{message.text}</div>
             </div>
           </div>
         ))}
         {room.status === 'responding' ? (
-          <div className="arena-chat-typing"><div className="arena-typing-stack">{responding.slice(0, 4).map(profile => <Avatar key={profile.id} value={profile.avatar} name={profile.name} />)}</div><span>{respondingNames || 'AI'} 正在同时处理</span><WorkingDots /></div>
+          <div className="arena-chat-typing"><div className="arena-typing-stack">{responding.slice(0, 4).map(profile => <Avatar key={profile.id} value={profile.avatar} name={profile.name} />)}</div><span>{respondingNames || 'AI'} {t("chat.are.processing.in.parallel")}</span><WorkingDots /></div>
         ) : null}
-        {error ? <div className="arena-error">{error}</div> : null}
+        {error ? <div className="arena-error">{errorText(error)}</div> : null}
       </div>
       <footer className="arena-chat-compose">
-        {room.status === 'idle' && room.messages.some(message => message.kind === 'human') ? <div className="arena-chat-retry"><span>上一条没有收到回复或想重新请求？</span><button className="arena-control" type="button" disabled={busy} onClick={() => void retry()}>↻ 重试上一条</button></div> : null}
+        {room.status === 'idle' && room.messages.some(message => message.kind === 'human') ? <div className="arena-chat-retry"><span>{t("chat.no.reply.to.your.last.message.or.want.to")}</span><button className="arena-control" type="button" disabled={busy} onClick={() => void retry()}>{t("chat.retry.last.message")}</button></div> : null}
         {presets.length ? <div className="arena-preset-chips">{presets.map(preset => <button type="button" key={preset} onClick={() => setText(preset)}>{preset}</button>)}</div> : null}
-        <div className="arena-mention-bar"><span>点名：</span>{mentionable.map(profile => { const muted = mutedIds.has(profile.id); return <button type="button" key={profile.id} className={muted ? 'is-muted' : profile.id === 'administrator' ? 'is-admin' : ''} title={muted ? `${profile.name} 已静默，点击生成恢复指令` : `@${profile.name}`} onClick={() => setText(current => `${current}${current && !current.endsWith(' ') ? ' ' : ''}@${profile.name} ${muted ? '可以继续说话了 ' : ''}`)}><Avatar value={profile.avatar} name={profile.name} />@{profile.name}{muted ? ' · 静默' : ''}</button> })}</div>
-        <div><textarea className="arena-textarea" value={text} maxLength={4000} placeholder={room.status === 'responding' ? `${respondingNames || 'AI'} 正在并行处理，你仍可继续发言或 @其他成员…` : '发送消息；不 @ 时所有未静默的 AI 会同时回应；也可说“某某别说话”'} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="arena-send" type="button" disabled={busy || !text.trim()} onClick={() => void send()}>发送</button></div>
+        <div className="arena-mention-bar"><span>{t("chat.mention")}</span>{mentionable.map(profile => { const muted = mutedIds.has(profile.id); return <button type="button" key={profile.id} className={muted ? 'is-muted' : profile.id === 'administrator' ? 'is-admin' : ''} title={muted ? t("chat.value.is.muted.click.to.draft.an.unmute.command", { p0: profile.name }) : `@${profile.name}`} onClick={() => setText(current => `${current}${current && !current.endsWith(' ') ? ' ' : ''}@${profile.name} ${muted ? t("chat.you.can.speak.again") : ''}`)}><Avatar value={profile.avatar} name={profile.name} />@{profile.name}{muted ? t("chat.muted") : ''}</button> })}</div>
+        <div><textarea className="arena-textarea" value={text} maxLength={4000} placeholder={room.status === 'responding' ? t("chat.value.are.working.in.parallel.you.can.still.speak", { p0: respondingNames || 'AI' }) : t("chat.send.a.message.without.mentions.all.unmuted.ai.users")} onChange={event => setText(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="arena-send" type="button" disabled={busy || !text.trim()} onClick={() => void send()}>{t("chat.send")}</button></div>
       </footer>
     </div>
-    <div className="arena-chat-resizer" role="separator" aria-label="调整右侧状态栏宽度" aria-orientation="vertical" aria-valuemin={240} aria-valuemax={560} aria-valuenow={monitorWidth} tabIndex={0} onPointerDown={resizeMonitor} onKeyDown={event => { if (event.key === 'ArrowLeft') setMonitorWidth(width => Math.min(560, width + 20)); else if (event.key === 'ArrowRight') setMonitorWidth(width => Math.max(240, width - 20)) }} />
+    <div className="arena-chat-resizer" role="separator" aria-label={t("chat.resize.the.right.activity.panel")} aria-orientation="vertical" aria-valuemin={240} aria-valuemax={560} aria-valuenow={monitorWidth} tabIndex={0} onPointerDown={resizeMonitor} onKeyDown={event => { if (event.key === 'ArrowLeft') setMonitorWidth(width => Math.min(560, width + 20)); else if (event.key === 'ArrowRight') setMonitorWidth(width => Math.max(240, width - 20)) }} />
     <aside className="arena-chat-side"><RoleMonitor monitor={room.activityMonitor} /></aside>
     </div>
   )
@@ -1452,12 +1489,12 @@ function HistoryView(props: {
   const { meetings, rooms, filter, onFilter, onOpenMeeting, onOpenRoom, onRenameMeeting, onRenameRoom, onDeleteMeeting, onDeleteRoom } = props
   const [editing, setEditing] = useState<{ kind: 'meeting' | 'room'; id: string; name: string } | null>(null)
   const [busyId, setBusyId] = useState('')
-  const [error, setError] = useState('')
+  const [error, setError] = useState<UiNotice>('')
   const filteredRooms = rooms.filter(room => room.type === filter)
 
   const saveName = async (): Promise<void> => {
     if (!editing || !editing.name.trim()) {
-      setError('名称不能为空。')
+      setError(notice("history.the.name.cannot.be.empty"))
       return
     }
     setBusyId(editing.id)
@@ -1467,70 +1504,70 @@ function HistoryView(props: {
       else await onRenameRoom(editing.id, editing.name.trim())
       setEditing(null)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusyId('') }
   }
 
   const removeMeeting = async (meeting: Meeting): Promise<void> => {
     if (BUSY_MEETINGS.has(meeting.status)) {
-      setError('AI 正在工作，请先停止当前工作再删除会议。')
+      setError(notice("history.ai.users.are.working.stop.the.current.work.before"))
       return
     }
-    if (!window.confirm(`永久删除会议记录“${meetingTitle(meeting)}”？此操作无法撤销。`)) return
+    if (!window.confirm(t("history.permanently.delete.meeting.value.this.cannot.be.undone", { p0: meetingTitle(meeting) }))) return
     setBusyId(meeting.id)
     setError('')
     try { await onDeleteMeeting(meeting.id) } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusyId('') }
   }
 
   const removeRoom = async (room: ChatRoom): Promise<void> => {
-    if (!window.confirm(`永久删除${room.type === 'direct' ? '私聊' : '群聊'}“${room.name}”及全部消息？此操作无法撤销。`)) return
+    if (!window.confirm(t("history.permanently.delete.value.value.and.all.its.messages.this", { p0: room.type === 'direct' ? t("chat.direct.chat.2") : t("history.group.chat"), p1: room.name }))) return
     setBusyId(room.id)
     setError('')
     try { await onDeleteRoom(room.id) } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
     } finally { setBusyId('') }
   }
 
   const dateText = (value: string): string => {
-    try { return new Date(value).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) } catch { return '' }
+    try { return new Date(value).toLocaleString(localeTag(), { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) } catch { return '' }
   }
 
   return (
     <div className="arena-history">
       <div className="arena-page-scroll">
-        <div className="arena-kicker">History manager</div>
-        <h2>历史记录管理</h2>
-        <p className="arena-lead">会议名称与实际讨论主题分开保存。你可以放心重命名记录，不会改变会议内容。</p>
+        <div className="arena-kicker">{t("history.history")}</div>
+        <h2>{t("history.history")}</h2>
+        <p className="arena-lead">{t("history.meeting.names.are.stored.separately.from.discussion.topics.renaming")}</p>
         <div className="arena-history-tabs">
-          <button type="button" className={filter === 'meeting' ? 'is-active' : ''} onClick={() => { onFilter('meeting'); setEditing(null); setError('') }}>协作会议 <i>{meetings.length}</i></button>
-          <button type="button" className={filter === 'direct' ? 'is-active' : ''} onClick={() => { onFilter('direct'); setEditing(null); setError('') }}>AI 私聊 <i>{rooms.filter(room => room.type === 'direct').length}</i></button>
-          <button type="button" className={filter === 'group' ? 'is-active' : ''} onClick={() => { onFilter('group'); setEditing(null); setError('') }}>AI 群聊 <i>{rooms.filter(room => room.type === 'group').length}</i></button>
+          <button type="button" className={filter === 'meeting' ? 'is-active' : ''} onClick={() => { onFilter('meeting'); setEditing(null); setError('') }}>{t("history.meetings")} <i>{meetings.length}</i></button>
+          <button type="button" className={filter === 'direct' ? 'is-active' : ''} onClick={() => { onFilter('direct'); setEditing(null); setError('') }}>{t("history.ai.direct.chats")} <i>{rooms.filter(room => room.type === 'direct').length}</i></button>
+          <button type="button" className={filter === 'group' ? 'is-active' : ''} onClick={() => { onFilter('group'); setEditing(null); setError('') }}>{t("history.ai.group.chats")} <i>{rooms.filter(room => room.type === 'group').length}</i></button>
         </div>
-        {error ? <div className="arena-page-alert" role="alert">{error}</div> : null}
+        {error ? <div className="arena-page-alert" role="alert">{errorText(error)}</div> : null}
         <div className="arena-history-list">
           {filter === 'meeting' ? meetings.map(meeting => (
             <article className="arena-history-card" key={meeting.id}>
               <div className="arena-history-avatars">{meeting.participants.slice(0, 3).map((participant, index) => <span key={participant.id} style={{ zIndex: 4 - index }}><Avatar value={participant.avatar} name={participant.name} /></span>)}</div>
               <button className="arena-history-open" type="button" onClick={() => onOpenMeeting(meeting.id)}>
                 <strong>{meetingTitle(meeting)}</strong>
-                <span>{meeting.displayName ? `原主题：${meeting.topic}` : meeting.topic}</span>
-                <small>{STATUS_TEXT[meeting.status] ?? meeting.status} · {dateText(meeting.createdAt)} · {meeting.transcript.filter(item => item.kind !== 'system').length} 条消息</small>
+                <span>{meeting.displayName ? t("history.original.topic.value", { p0: meeting.topic }) : meeting.topic}</span>
+                <small>{STATUS_TEXT()[meeting.status] ?? meeting.status} · {dateText(meeting.createdAt)} · {t("counts.messages", { count: meeting.transcript.filter(item => item.kind !== 'system').length })}</small>
               </button>
-              <div className="arena-history-actions"><button type="button" onClick={() => { setEditing({ kind: 'meeting', id: meeting.id, name: meetingTitle(meeting) }); setError('') }}>重命名</button><button className="is-danger" type="button" disabled={BUSY_MEETINGS.has(meeting.status) || busyId === meeting.id} title={BUSY_MEETINGS.has(meeting.status) ? '请先停止当前 AI 工作' : '删除会议'} onClick={() => void removeMeeting(meeting)}>删除</button></div>
-              {editing?.kind === 'meeting' && editing.id === meeting.id ? <div className="arena-history-editor"><input className="arena-input" value={editing.name} maxLength={80} autoFocus onChange={event => setEditing({ ...editing, name: event.target.value })} onKeyDown={event => { if (event.key === 'Enter') void saveName(); if (event.key === 'Escape') setEditing(null) }} /><button className="arena-send" type="button" disabled={busyId === meeting.id} onClick={() => void saveName()}>保存</button><button className="arena-control" type="button" onClick={() => setEditing(null)}>取消</button></div> : null}
+              <div className="arena-history-actions"><button type="button" onClick={() => { setEditing({ kind: 'meeting', id: meeting.id, name: meetingTitle(meeting) }); setError('') }}>{t("history.rename")}</button><button className="is-danger" type="button" disabled={BUSY_MEETINGS.has(meeting.status) || busyId === meeting.id} title={BUSY_MEETINGS.has(meeting.status) ? t("history.stop.the.current.ai.work.first") : t("history.delete.meeting")} onClick={() => void removeMeeting(meeting)}>{t("history.delete")}</button></div>
+              {editing?.kind === 'meeting' && editing.id === meeting.id ? <div className="arena-history-editor"><input className="arena-input" value={editing.name} maxLength={80} autoFocus onChange={event => setEditing({ ...editing, name: event.target.value })} onKeyDown={event => { if (event.key === 'Enter') void saveName(); if (event.key === 'Escape') setEditing(null) }} /><button className="arena-send" type="button" disabled={busyId === meeting.id} onClick={() => void saveName()}>{t("history.save")}</button><button className="arena-control" type="button" onClick={() => setEditing(null)}>{t("avatar.cancel")}</button></div> : null}
             </article>
           )) : filteredRooms.map(room => (
             <article className="arena-history-card" key={room.id}>
               <div className="arena-history-avatars">{room.participants.slice(0, 3).map((participant, index) => <span key={participant.id} style={{ zIndex: 4 - index }}><Avatar value={participant.avatar} name={participant.name} /></span>)}</div>
-              <button className="arena-history-open" type="button" onClick={() => onOpenRoom(room.id)}><strong>{room.name}</strong><span>{room.type === 'direct' ? `与 ${room.participants[0]?.name || 'AI'} 的私聊` : `${room.participants.length} 位 AI + 管理员`}</span><small>{room.status === 'responding' ? '回复中' : '空闲'} · {dateText(room.updatedAt)} · {room.messages.length} 条消息</small></button>
-              <div className="arena-history-actions"><button type="button" onClick={() => { setEditing({ kind: 'room', id: room.id, name: room.name }); setError('') }}>重命名</button><button className="is-danger" type="button" disabled={busyId === room.id} onClick={() => void removeRoom(room)}>删除</button></div>
-              {editing?.kind === 'room' && editing.id === room.id ? <div className="arena-history-editor"><input className="arena-input" value={editing.name} maxLength={80} autoFocus onChange={event => setEditing({ ...editing, name: event.target.value })} onKeyDown={event => { if (event.key === 'Enter') void saveName(); if (event.key === 'Escape') setEditing(null) }} /><button className="arena-send" type="button" disabled={busyId === room.id} onClick={() => void saveName()}>保存</button><button className="arena-control" type="button" onClick={() => setEditing(null)}>取消</button></div> : null}
+              <button className="arena-history-open" type="button" onClick={() => onOpenRoom(room.id)}><strong>{room.name}</strong><span>{room.type === 'direct' ? t("history.direct.chat.with.value", { p0: room.participants[0]?.name || 'AI' }) : t("history.value.ai.users.administrator", { p0: room.participants.length })}</span><small>{room.status === 'responding' ? t("history.responding") : t("role_activity.idle")} · {dateText(room.updatedAt)} · {t("counts.messages", { count: room.messages.length })}</small></button>
+              <div className="arena-history-actions"><button type="button" onClick={() => { setEditing({ kind: 'room', id: room.id, name: room.name }); setError('') }}>{t("history.rename")}</button><button className="is-danger" type="button" disabled={busyId === room.id} onClick={() => void removeRoom(room)}>{t("history.delete")}</button></div>
+              {editing?.kind === 'room' && editing.id === room.id ? <div className="arena-history-editor"><input className="arena-input" value={editing.name} maxLength={80} autoFocus onChange={event => setEditing({ ...editing, name: event.target.value })} onKeyDown={event => { if (event.key === 'Enter') void saveName(); if (event.key === 'Escape') setEditing(null) }} /><button className="arena-send" type="button" disabled={busyId === room.id} onClick={() => void saveName()}>{t("history.save")}</button><button className="arena-control" type="button" onClick={() => setEditing(null)}>{t("avatar.cancel")}</button></div> : null}
             </article>
           ))}
-          {filter === 'meeting' && !meetings.length ? <div className="arena-history-empty">还没有会议记录。</div> : null}
-          {filter !== 'meeting' && !filteredRooms.length ? <div className="arena-history-empty">还没有{filter === 'direct' ? '私聊' : '群聊'}记录。</div> : null}
+          {filter === 'meeting' && !meetings.length ? <div className="arena-history-empty">{t("history.no.meetings.yet")}</div> : null}
+          {filter !== 'meeting' && !filteredRooms.length ? <div className="arena-history-empty">{t(filter === 'direct' ? "history.emptyDirect" : "history.emptyGroup")}</div> : null}
         </div>
       </div>
     </div>
@@ -1567,9 +1604,9 @@ function CollaborationConsole(props: {
   const decisions = meeting.decisions ?? []
   const artifacts = meeting.artifacts ?? []
   const stage = meeting.collaborationStage ?? (meeting.status === 'completed' ? 'completed' : 'discussion')
-  const administrator = meeting.administratorProfile ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
+  const administrator = meeting.administratorProfile ?? { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' }
   const owners = [{ id: 'administrator', name: administrator.name }, ...meeting.participants.map(item => ({ id: item.id || '', name: item.name }))]
-  const ownerName = (id: string | null): string => owners.find(item => item.id === id)?.name || '未分配'
+  const ownerName = (id: string | null): string => owners.find(item => item.id === id)?.name || t("board.unassigned")
   const blockers = tasks.filter(item => item.status === 'blocked')
 
   const resizeSection = (event: ReactPointerEvent<HTMLDivElement>, key: Exclude<WorkspaceTab, 'activity'>): void => {
@@ -1609,103 +1646,104 @@ function CollaborationConsole(props: {
   return (
     <aside className="arena-workspace-panel">
       <div className="arena-workspace-stage">
-        <span><small>会议阶段</small><strong>{MEETING_STAGE_TEXT[stage]}</strong></span>
+        <span><small>{t("board.meeting.stage")}</small><strong>{MEETING_STAGE_TEXT()[stage]}</strong></span>
         <select value={stage} disabled={busy || stage === 'completed'} onChange={event => void onAction({ action: 'set-stage', stage: event.target.value })}>
-          {(Object.keys(MEETING_STAGE_TEXT) as MeetingStage[]).filter(item => item !== 'completed').map(item => <option value={item} key={item}>{MEETING_STAGE_TEXT[item]}</option>)}
-          {stage === 'completed' ? <option value="completed">已完成</option> : null}
+          {(Object.keys(MEETING_STAGE_TEXT()) as MeetingStage[]).filter(item => item !== 'completed').map(item => <option value={item} key={item}>{MEETING_STAGE_TEXT()[item]}</option>)}
+          {stage === 'completed' ? <option value="completed">{t("meeting_stage.completed")}</option> : null}
         </select>
       </div>
-      <div className="arena-workspace-tabs" role="tablist" aria-label="协作控制台">
-        <button type="button" className={tab === 'activity' ? 'is-active' : ''} onClick={() => setTab('activity')}><span>动态</span><i>{meeting.activityMonitor?.roles.filter(item => !['idle', 'muted'].includes(item.status)).length || 0}</i></button>
-        <button type="button" className={tab === 'tasks' ? 'is-active' : ''} onClick={() => setTab('tasks')}><span>任务</span><i>{tasks.length}</i></button>
-        <button type="button" className={tab === 'decisions' ? 'is-active' : ''} onClick={() => setTab('decisions')}><span>决策</span><i>{decisions.filter(item => item.status === 'open').length}</i></button>
-        <button type="button" className={tab === 'artifacts' ? 'is-active' : ''} onClick={() => setTab('artifacts')}><span>成果</span><i>{artifacts.length}</i></button>
+      <div className="arena-workspace-tabs" role="tablist" aria-label={t("board.collaboration.panel")}>
+        <button type="button" className={tab === 'activity' ? 'is-active' : ''} onClick={() => setTab('activity')}><span>{t("board.activity")}</span><i>{meeting.activityMonitor?.roles.filter(item => !['idle', 'muted'].includes(item.status)).length || 0}</i></button>
+        <button type="button" className={tab === 'tasks' ? 'is-active' : ''} onClick={() => setTab('tasks')}><span>{t("board.tasks")}</span><i>{tasks.length}</i></button>
+        <button type="button" className={tab === 'decisions' ? 'is-active' : ''} onClick={() => setTab('decisions')}><span>{t("board.decisions")}</span><i>{decisions.filter(item => item.status === 'open').length}</i></button>
+        <button type="button" className={tab === 'artifacts' ? 'is-active' : ''} onClick={() => setTab('artifacts')}><span>{t("board.deliverables")}</span><i>{artifacts.length}</i></button>
       </div>
 
       <div className="arena-workspace-scroll">
         {tab === 'activity' ? <RoleMonitor monitor={meeting.activityMonitor} permissions={meeting.permissions} onPermission={onPermission} /> : null}
 
         {tab === 'tasks' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.tasks}px` }}>
-          <div className="arena-workspace-section__head"><span><h3>任务板</h3><p>{blockers.length ? `${blockers.length} 项受阻，需要处理` : '分配负责人并跟踪交付状态'}</p></span><button type="button" onClick={() => setTaskFormOpen(value => !value)}>＋ 新建</button></div>
+          <div className="arena-workspace-section__head"><span><h3>{t("board.task.board")}</h3><p>{blockers.length ? t("board.value.blocked.tasks.need.attention", { p0: blockers.length }) : t("board.assign.owners.and.track.delivery")}</p></span><button type="button" onClick={() => setTaskFormOpen(value => !value)}>{t("board.new")}</button></div>
           {taskFormOpen ? <div className="arena-workspace-form">
-            <input className="arena-input" value={taskTitle} maxLength={160} placeholder="任务标题" onChange={event => setTaskTitle(event.target.value)} />
-            <textarea className="arena-textarea" value={taskDescription} maxLength={1600} placeholder="完成标准、依赖或补充说明（可选）" onChange={event => setTaskDescription(event.target.value)} />
-            <select value={taskAssignee} onChange={event => setTaskAssignee(event.target.value)}><option value="">未分配</option>{owners.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select>
-            <div><button className="is-primary" type="button" disabled={busy || !taskTitle.trim()} onClick={() => void createTask()}>创建任务</button><button type="button" onClick={() => setTaskFormOpen(false)}>取消</button></div>
+            <input className="arena-input" value={taskTitle} maxLength={160} placeholder={t("board.task.title")} onChange={event => setTaskTitle(event.target.value)} />
+            <textarea className="arena-textarea" value={taskDescription} maxLength={1600} placeholder={t("board.acceptance.criteria.dependencies.or.notes.optional")} onChange={event => setTaskDescription(event.target.value)} />
+            <select value={taskAssignee} onChange={event => setTaskAssignee(event.target.value)}><option value="">{t("board.unassigned")}</option>{owners.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select>
+            <div><button className="is-primary" type="button" disabled={busy || !taskTitle.trim()} onClick={() => void createTask()}>{t("board.create.task")}</button><button type="button" onClick={() => setTaskFormOpen(false)}>{t("avatar.cancel")}</button></div>
           </div> : null}
           <div className="arena-task-list">{tasks.map(task => <article className="arena-task-card" data-status={task.status} key={task.id}>
-            <div className="arena-task-card__head"><strong>{task.title}</strong><em>{TASK_STATUS_TEXT[task.status]}</em></div>
+            <div className="arena-task-card__head"><strong>{task.title}</strong><em>{TASK_STATUS_TEXT()[task.status]}</em></div>
             {task.description ? <p>{task.description}</p> : null}
             <div className="arena-task-card__fields">
-              <select aria-label="任务负责人" value={task.assigneeId || ''} disabled={busy} onChange={event => void onAction({ action: 'task-update', taskId: task.id, assigneeId: event.target.value })}><option value="">未分配</option>{owners.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select>
-              <select aria-label="任务状态" value={task.status} disabled={busy} onChange={event => void onAction({ action: 'task-update', taskId: task.id, status: event.target.value })}>{(Object.keys(TASK_STATUS_TEXT) as TaskStatus[]).map(status => <option value={status} key={status}>{TASK_STATUS_TEXT[status]}</option>)}</select>
+              <select aria-label={t("board.task.owner")} value={task.assigneeId || ''} disabled={busy} onChange={event => void onAction({ action: 'task-update', taskId: task.id, assigneeId: event.target.value })}><option value="">{t("board.unassigned")}</option>{owners.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select>
+              <select aria-label={t("board.task.status")} value={task.status} disabled={busy} onChange={event => void onAction({ action: 'task-update', taskId: task.id, status: event.target.value })}>{(Object.keys(TASK_STATUS_TEXT()) as TaskStatus[]).map(status => <option value={status} key={status}>{TASK_STATUS_TEXT()[status]}</option>)}</select>
             </div>
             <div className="arena-card-actions">
-              {task.status === 'todo' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>▶ 开始任务</button> : null}
-              {task.status === 'paused' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>▶ 继续任务</button> : null}
-              {task.status === 'in-progress' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'paused' })}>Ⅱ 暂停任务</button> : null}
-              {task.status === 'blocked' ? <><button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>↻ 重新处理</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: `受阻任务“${task.title}”` })}>发起复核</button></> : null}
-              <button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除任务“${task.title}”？`)) void onAction({ action: 'task-delete', taskId: task.id }) }}>删除</button>
+              {task.status === 'todo' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.start.task")}</button> : null}
+              {task.status === 'paused' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.continue.task")}</button> : null}
+              {task.status === 'in-progress' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'paused' })}>{t("board.pause.task")}</button> : null}
+              {task.status === 'blocked' ? <><button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.rework")}</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.blocked.task.value", { p0: task.title }) })}>{t("board.request.review")}</button></> : null}
+              <button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(t("board.delete.task.value", { p0: task.title }))) void onAction({ action: 'task-delete', taskId: task.id }) }}>{t("history.delete")}</button>
             </div>
           </article>)}</div>
-          {!tasks.length ? <div className="arena-workspace-empty">还没有任务。人类或 AI 都可以把工作拆到这里。</div> : null}
-        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整任务板高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.tasks} tabIndex={0} onPointerDown={event => resizeSection(event, 'tasks')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, tasks: Math.max(220, current.tasks - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, tasks: Math.min(1000, current.tasks + 20) })) }} /> </> : null}
+          {!tasks.length ? <div className="arena-workspace-empty">{t("board.no.tasks.yet.you.and.the.ai.users.can")}</div> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label={t("board.resize.the.task.board")} aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.tasks} tabIndex={0} onPointerDown={event => resizeSection(event, 'tasks')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, tasks: Math.max(220, current.tasks - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, tasks: Math.min(1000, current.tasks + 20) })) }} /> </> : null}
 
         {tab === 'decisions' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.decisions}px` }}>
-          <div className="arena-workspace-section__head"><span><h3>决策板</h3><p>比较方案与风险，由你做最终选择</p></span><button type="button" onClick={() => setDecisionFormOpen(value => !value)}>＋ 新建</button></div>
+          <div className="arena-workspace-section__head"><span><h3>{t("board.decision.board")}</h3><p>{t("board.compare.options.and.risks.you.make.the.final.decision")}</p></span><button type="button" onClick={() => setDecisionFormOpen(value => !value)}>{t("board.new")}</button></div>
           {decisionFormOpen ? <div className="arena-workspace-form">
-            <input className="arena-input" value={decisionTitle} maxLength={160} placeholder="要决定什么？" onChange={event => setDecisionTitle(event.target.value)} />
-            <textarea className="arena-textarea" value={decisionDescription} maxLength={1600} placeholder="背景和约束（可选）" onChange={event => setDecisionDescription(event.target.value)} />
-            <textarea className="arena-textarea" value={decisionOptions} placeholder={'每行一个方案，至少两行\n方案 A\n方案 B'} onChange={event => setDecisionOptions(event.target.value)} />
-            <div><button className="is-primary" type="button" disabled={busy || !decisionTitle.trim() || decisionOptions.split('\n').filter(item => item.trim()).length < 2} onClick={() => void createDecision()}>创建决策</button><button type="button" onClick={() => setDecisionFormOpen(false)}>取消</button></div>
+            <input className="arena-input" value={decisionTitle} maxLength={160} placeholder={t("board.what.needs.to.be.decided")} onChange={event => setDecisionTitle(event.target.value)} />
+            <textarea className="arena-textarea" value={decisionDescription} maxLength={1600} placeholder={t("board.background.and.constraints.optional")} onChange={event => setDecisionDescription(event.target.value)} />
+            <textarea className="arena-textarea" value={decisionOptions} placeholder={t("board.one.option.per.line.at.least.two.option.a")} onChange={event => setDecisionOptions(event.target.value)} />
+            <div><button className="is-primary" type="button" disabled={busy || !decisionTitle.trim() || decisionOptions.split('\n').filter(item => item.trim()).length < 2} onClick={() => void createDecision()}>{t("board.create.decision")}</button><button type="button" onClick={() => setDecisionFormOpen(false)}>{t("avatar.cancel")}</button></div>
           </div> : null}
           <div className="arena-decision-list">{decisions.map(decision => <article className="arena-decision-card" data-status={decision.status} key={decision.id}>
-            <div className="arena-decision-card__head"><span><strong>{decision.title}</strong><small>{decision.status === 'decided' ? '已决定' : '等待你选择'}</small></span>{decision.status === 'decided' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'decision-reopen', decisionId: decision.id })}>重开讨论</button> : null}</div>
+            <div className="arena-decision-card__head"><span><strong>{decision.title}</strong><small>{decision.status === 'decided' ? t("board.decided") : t("board.awaiting.your.choice")}</small></span>{decision.status === 'decided' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'decision-reopen', decisionId: decision.id })}>{t("board.reopen.discussion")}</button> : null}</div>
             {decision.description ? <p>{decision.description}</p> : null}
             <div className="arena-option-list">{decision.options.map(option => {
               const selected = decision.selectedOptionId === option.id
               return <div className={selected ? 'arena-option is-selected' : 'arena-option'} key={option.id}>
-                <div className="arena-option__head"><span><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span><button type="button" disabled={busy || selected} onClick={() => void onAction({ action: 'decision-choose', decisionId: decision.id, optionId: option.id })}>{selected ? '✓ 已选择' : decision.status === 'decided' ? '改选' : '选择方案'}</button></div>
-                {(option.opinions ?? []).map(opinion => <div className="arena-opinion" data-stance={opinion.stance} key={opinion.profileId}><Avatar value={opinion.avatar} name={opinion.name} /><span><strong>{opinion.name} · {opinion.stance === 'support' ? '支持' : opinion.stance === 'oppose' ? '反对' : '中立'} · 信心 {opinion.confidence}%</strong><p>{opinion.reason || '未填写理由'}</p>{opinion.risk ? <small>风险：{opinion.risk}</small> : null}</span></div>)}
+                <div className="arena-option__head"><span><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span><button type="button" disabled={busy || selected} onClick={() => void onAction({ action: 'decision-choose', decisionId: decision.id, optionId: option.id })}>{selected ? t("board.selected") : decision.status === 'decided' ? t("board.change.choice") : t("board.choose.option")}</button></div>
+                {(option.opinions ?? []).map(opinion => <div className="arena-opinion" data-stance={opinion.stance} key={opinion.profileId}><Avatar value={opinion.avatar} name={opinion.name} /><span><strong>{opinion.name} · {opinion.stance === 'support' ? t("board.support") : opinion.stance === 'oppose' ? t("board.oppose") : t("board.neutral")} {t("board.confidence")} {opinion.confidence}%</strong><p>{opinion.reason || t("board.no.reason.provided")}</p>{opinion.risk ? <small>{t("board.risks")}{opinion.risk}</small> : null}</span></div>)}
               </div>
             })}</div>
-            <div className="arena-card-actions"><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: `决策“${decision.title}”` })}>要求证据</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除决策“${decision.title}”？`)) void onAction({ action: 'decision-delete', decisionId: decision.id }) }}>删除</button></div>
+            <div className="arena-card-actions"><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.decision.value", { p0: decision.title }) })}>{t("board.request.evidence")}</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(t("board.delete.decision.value", { p0: decision.title }))) void onAction({ action: 'decision-delete', decisionId: decision.id }) }}>{t("history.delete")}</button></div>
           </article>)}</div>
-          {!decisions.length ? <div className="arena-workspace-empty">出现多个可行方案时，把它们放到这里比较理由、风险与可行性。</div> : null}
-        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整决策板高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.decisions} tabIndex={0} onPointerDown={event => resizeSection(event, 'decisions')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, decisions: Math.max(220, current.decisions - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, decisions: Math.min(1000, current.decisions + 20) })) }} /> </> : null}
+          {!decisions.length ? <div className="arena-workspace-empty">{t("board.when.several.options.are.viable.compare.their.reasoning.risks")}</div> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label={t("board.resize.the.decision.board")} aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.decisions} tabIndex={0} onPointerDown={event => resizeSection(event, 'decisions')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, decisions: Math.max(220, current.decisions - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, decisions: Math.min(1000, current.decisions + 20) })) }} /> </> : null}
 
         {tab === 'artifacts' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.artifacts}px` }}>
-          <div className="arena-workspace-section__head"><span><h3>成果库</h3><p>文件、链接、结论与阶段总结</p></span><button type="button" onClick={() => setArtifactFormOpen(value => !value)}>＋ 添加</button></div>
+          <div className="arena-workspace-section__head"><span><h3>{t("board.deliverable.library")}</h3><p>{t("board.files.links.conclusions.and.progress.summaries")}</p></span><button type="button" onClick={() => setArtifactFormOpen(value => !value)}>{t("board.add")}</button></div>
           {artifactFormOpen ? <div className="arena-workspace-form">
-            <input className="arena-input" value={artifactTitle} maxLength={160} placeholder="成果标题" onChange={event => setArtifactTitle(event.target.value)} />
-            <textarea className="arena-textarea" value={artifactDescription} maxLength={2400} placeholder="内容或验收说明" onChange={event => setArtifactDescription(event.target.value)} />
-            <div className="arena-form-row"><select value={artifactType} onChange={event => setArtifactType(event.target.value as MeetingArtifact['artifactType'])}><option value="note">结论</option><option value="file">文件</option><option value="link">链接</option><option value="summary">总结</option></select><input className="arena-input" value={artifactLocation} maxLength={1600} placeholder="文件路径或 URL（可选）" onChange={event => setArtifactLocation(event.target.value)} /></div>
-            <div><button className="is-primary" type="button" disabled={busy || !artifactTitle.trim()} onClick={() => void createArtifact()}>登记成果</button><button type="button" onClick={() => setArtifactFormOpen(false)}>取消</button></div>
+            <input className="arena-input" value={artifactTitle} maxLength={160} placeholder={t("board.deliverable.title")} onChange={event => setArtifactTitle(event.target.value)} />
+            <textarea className="arena-textarea" value={artifactDescription} maxLength={2400} placeholder={t("board.content.or.review.notes")} onChange={event => setArtifactDescription(event.target.value)} />
+            <div className="arena-form-row"><select value={artifactType} onChange={event => setArtifactType(event.target.value as MeetingArtifact['artifactType'])}><option value="note">{t("board.conclusion")}</option><option value="file">{t("board.file")}</option><option value="link">{t("board.link")}</option><option value="summary">{t("board.summary")}</option></select><input className="arena-input" value={artifactLocation} maxLength={1600} placeholder={t("board.file.path.or.url.optional")} onChange={event => setArtifactLocation(event.target.value)} /></div>
+            <div><button className="is-primary" type="button" disabled={busy || !artifactTitle.trim()} onClick={() => void createArtifact()}>{t("board.register.deliverable")}</button><button type="button" onClick={() => setArtifactFormOpen(false)}>{t("avatar.cancel")}</button></div>
           </div> : null}
           <div className="arena-artifact-list">{artifacts.map(artifact => <article className="arena-artifact-card" data-status={artifact.status} key={artifact.id}>
-            <div className="arena-artifact-card__head"><span>{artifact.artifactType === 'file' ? '📄' : artifact.artifactType === 'link' ? '🔗' : artifact.artifactType === 'summary' ? '📋' : '💡'}</span><div><strong>{artifact.title}</strong><small>{artifact.status === 'accepted' ? '已验收' : artifact.status === 'rejected' ? '已驳回' : '待验收'} · {ownerName(artifact.ownerId)}</small></div></div>
+            <div className="arena-artifact-card__head"><span>{artifact.artifactType === 'file' ? '📄' : artifact.artifactType === 'link' ? '🔗' : artifact.artifactType === 'summary' ? '📋' : '💡'}</span><div><strong>{artifact.title}</strong><small>{artifact.status === 'accepted' ? t("board.accepted") : artifact.status === 'rejected' ? t("board.rejected") : t("board.awaiting.review")} · {ownerName(artifact.ownerId)}</small></div></div>
             {artifact.description ? <p>{artifact.description}</p> : null}
             {artifact.location ? (/^https?:\/\//i.test(artifact.location) ? <a href={artifact.location} target="_blank" rel="noreferrer">{artifact.location}</a> : <code>{artifact.location}</code>) : null}
-            <div className="arena-card-actions"><button type="button" disabled={busy || artifact.status === 'accepted'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'accepted' })}>验收</button><button type="button" disabled={busy || artifact.status === 'rejected'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'rejected' })}>驳回结果</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: `成果“${artifact.title}”` })}>要求证据</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(`删除成果“${artifact.title}”？`)) void onAction({ action: 'artifact-delete', artifactId: artifact.id }) }}>删除</button></div>
+            <div className="arena-card-actions"><button type="button" disabled={busy || artifact.status === 'accepted'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'accepted' })}>{t("board.accept")}</button><button type="button" disabled={busy || artifact.status === 'rejected'} onClick={() => void onAction({ action: 'artifact-update', artifactId: artifact.id, status: 'rejected' })}>{t("board.reject.result")}</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.deliverable.value", { p0: artifact.title }) })}>{t("board.request.evidence")}</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(t("board.delete.deliverable.value", { p0: artifact.title }))) void onAction({ action: 'artifact-delete', artifactId: artifact.id }) }}>{t("history.delete")}</button></div>
           </article>)}</div>
-          {!artifacts.length ? <div className="arena-workspace-empty">AI 完成文件、调研、链接或结论后，会沉淀在这里等待你验收。</div> : null}
-        </section><div className="arena-workspace-section-resizer" role="separator" aria-label="调整成果库高度" aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.artifacts} tabIndex={0} onPointerDown={event => resizeSection(event, 'artifacts')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, artifacts: Math.max(220, current.artifacts - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, artifacts: Math.min(1000, current.artifacts + 20) })) }} /> </> : null}
+          {!artifacts.length ? <div className="arena-workspace-empty">{t("board.completed.files.research.links.and.conclusions.appear.here.for")}</div> : null}
+        </section><div className="arena-workspace-section-resizer" role="separator" aria-label={t("board.resize.the.deliverable.library")} aria-orientation="horizontal" aria-valuemin={220} aria-valuemax={1000} aria-valuenow={sectionHeights.artifacts} tabIndex={0} onPointerDown={event => resizeSection(event, 'artifacts')} onKeyDown={event => { if (event.key === 'ArrowUp') setSectionHeights(current => ({ ...current, artifacts: Math.max(220, current.artifacts - 20) })); else if (event.key === 'ArrowDown') setSectionHeights(current => ({ ...current, artifacts: Math.min(1000, current.artifacts + 20) })) }} /> </> : null}
       </div>
 
       <div className="arena-workspace-quick">
-        <button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: '当前方案与成果' })}>🔎 要求全员补证据</button>
-        <button type="button" onClick={() => onCompose(`@${administrator.name} 把话题改为：`)}>✎ 更换话题</button>
+        <button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.current.proposals.and.deliverables") })}>{t("board.ask.everyone.for.evidence")}</button>
+        <button type="button" onClick={() => onCompose(t("board.value.change.the.topic.to", { p0: administrator.name }))}>{t("board.change.topic")}</button>
       </div>
     </aside>
   )
 }
 
-function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; onAction: (body: object) => Promise<void>; onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void> }): ReactNode {
-  const { meeting, profiles, onAction, onApproval } = props
+function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; onAction: (body: object) => Promise<void>; onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void>; onSetWorkdir: (workdir: string) => Promise<string> }): ReactNode {
+  const { meeting, profiles, onAction, onApproval, onSetWorkdir } = props
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
+  const [error, setError] = useState<UiNotice>('')
   const [inviteOpen, setInviteOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [workspaceWidth, setWorkspaceWidth] = useState(370)
   const [headerHeight, setHeaderHeight] = useState(82)
@@ -1714,8 +1752,8 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
   const watchRef = useRef<HTMLDivElement>(null)
   const active = true
   const busyMeeting = BUSY_MEETINGS.has(meeting.status)
-  const administrator = meeting.administratorProfile ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
-  const human = meeting.humanProfile ?? { id: 'human', name: '你', avatar: '🧑' }
+  const administrator = meeting.administratorProfile ?? { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' }
+  const human = meeting.humanProfile ?? { id: 'human', name: t("users.you"), avatar: '🧑' }
   const working = meeting.participants.filter(item => item.status === 'thinking' || item.status === 'acknowledging' || item.status === 'working')
   const mutedIds = new Set(meeting.mutedParticipantIds ?? [])
   const availableInvitees = (profiles?.aiUsers ?? []).filter(profile => !meeting.participants.some(participant => participant.id === profile.id))
@@ -1732,7 +1770,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
       await onAction(body)
       return true
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(captureError(cause))
       return false
     } finally { setBusy(false) }
   }
@@ -1779,7 +1817,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
   }
 
   const inviteMembers = async (): Promise<void> => {
-    if (!inviteIds.length) { setError('请至少选择一位要邀请的 AI 用户。'); return }
+    if (!inviteIds.length) { setError(notice("chat.select.at.least.one.ai.user.to.invite")); return }
     if (await act({ action: 'invite-members', profileIds: inviteIds })) {
       setInviteIds([])
       setInviteOpen(false)
@@ -1799,40 +1837,46 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
         <div className="arena-watch-head__title">
           <h2 title={meeting.topic}>{meetingTitle(meeting)}</h2>
           <div className="arena-meta">
-            <span>{meeting.participants.length + 2} 位群成员</span>
-            <span>长期协作 · 随时继续</span>
+            <span>{t("counts.members", { count: meeting.participants.length + 2 })}</span>
+            <span>{t("meeting.ongoing.collaboration.continue.anytime")}</span>
           </div>
         </div>
         <div className="arena-watch-head__actions">
-          <button className="arena-control" type="button" onClick={() => { setInviteOpen(value => !value); setError('') }}>{inviteOpen ? '关闭邀请' : '＋ 邀请成员'}</button>
-          <span className="arena-status" data-status={meeting.status}>{STATUS_TEXT[meeting.status] ?? meeting.status}</span>
+          <button className="arena-control" type="button" onClick={() => { setSettingsOpen(value => !value); setInviteOpen(false) }}>{t("meeting.meeting.settings")}</button>
+          <button className="arena-control" type="button" onClick={() => { setInviteOpen(value => !value); setSettingsOpen(false); setError('') }}>{inviteOpen ? t("meeting.close.invitations") : t("meeting.invite.members")}</button>
+          <span className="arena-status" data-status={meeting.status}>{STATUS_TEXT()[meeting.status] ?? meeting.status}</span>
         </div>
-        <div className="arena-watch-head-resizer" role="separator" aria-label="调整会议顶部区域高度" aria-orientation="horizontal" aria-valuemin={64} aria-valuemax={240} aria-valuenow={headerHeight} tabIndex={0} onPointerDown={resizeHeader} onKeyDown={event => { if (event.key === 'ArrowUp') { event.preventDefault(); setHeaderHeight(height => Math.max(64, height - 10)) } else if (event.key === 'ArrowDown') { event.preventDefault(); setHeaderHeight(height => Math.min(240, height + 10)) } }} />
+        <div className="arena-watch-head-resizer" role="separator" aria-label={t("meeting.resize.the.meeting.header")} aria-orientation="horizontal" aria-valuemin={64} aria-valuemax={240} aria-valuenow={headerHeight} tabIndex={0} onPointerDown={resizeHeader} onKeyDown={event => { if (event.key === 'ArrowUp') { event.preventDefault(); setHeaderHeight(height => Math.max(64, height - 10)) } else if (event.key === 'ArrowDown') { event.preventDefault(); setHeaderHeight(height => Math.min(240, height + 10)) } }} />
       </div>
 
+      {settingsOpen ? <aside className="arena-chat-settings" aria-label={t("meeting.meeting.settings")}>
+        <div className="arena-chat-settings__head"><div><strong>{t("meeting.meeting.settings")}</strong></div><button type="button" aria-label={t("meeting.close.meeting.settings")} onClick={() => setSettingsOpen(false)}>×</button></div>
+        <WorkdirSettings key={meeting.id} value={meeting.workdir} onSave={onSetWorkdir} />
+      </aside> : null}
+
       {inviteOpen ? (
-        <aside className="arena-chat-settings arena-meeting-invite" aria-label="邀请会议成员">
-          <div className="arena-chat-settings__head"><div><strong>邀请 AI 用户</strong><span>当前 {meeting.participants.length}/12 位；加入后可以被 @，也会参与后续全员讨论</span></div><button type="button" aria-label="关闭邀请" onClick={() => setInviteOpen(false)}>×</button></div>
-          {availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : meeting.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">AI 用户库中没有可邀请的新成员。</div>}
-          <button className="arena-launch arena-invite-submit" type="button" disabled={busy || !inviteIds.length} onClick={() => void inviteMembers()}>{busy ? '处理中…' : `邀请选中的 ${inviteIds.length || ''} 位成员`}</button>
+        <aside className="arena-chat-settings arena-meeting-invite" aria-label={t("meeting.invite.meeting.members")}>
+          <div className="arena-chat-settings__head"><div><strong>{t("chat.invite.ai.users")}</strong><span>{t("counts.inviteMeetingCapacity", { count: meeting.participants.length })}</span></div><button type="button" aria-label={t("meeting.close.invitations")} onClick={() => setInviteOpen(false)}>×</button></div>
+          {availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : meeting.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">{t("chat.there.are.no.more.ai.users.available.to.invite")}</div>}
+          <button className="arena-launch arena-invite-submit" type="button" disabled={busy || !inviteIds.length} onClick={() => void inviteMembers()}>{busy ? t("chat.processing") : t("chat.invite.value.selected.members", { p0: inviteIds.length || '' })}</button>
         </aside>
       ) : null}
 
       <div className="arena-collab-layout" ref={collabRef} style={{ '--arena-workspace-width': `${workspaceWidth}px` } as CSSProperties}>
         <div className="arena-stage" ref={stageRef}>
-          {meeting.transcript.length === 0 ? <div className="arena-empty"><div><strong>{meeting.status === 'queued' ? '正在等候入群' : 'AI 成员正在准备发言'}</strong><WorkingDots /></div></div> : (
+          {meeting.transcript.length === 0 ? <div className="arena-empty"><div><strong>{meeting.status === 'queued' ? t("meeting.waiting.to.join") : t("meeting.ai.members.are.preparing.to.speak")}</strong><WorkingDots /></div></div> : (
             <div className="arena-transcript">
               {meeting.transcript.map(item => {
                 if (item.kind === 'system') return /^第\s*\d+\s*轮/.test(item.text)
                   ? null
-                  : <div className="arena-round-label" key={item.id}>{item.text}{item.approval ? <ApprovalCard approval={item.approval} onResolve={(outcome, note) => onApproval(item.approval!.id, outcome, note)} /> : null}</div>
+                  : <div className="arena-round-label" key={item.id}>{systemText(item.text, item.i18n)}{item.approval ? <ApprovalCard approval={item.approval} onResolve={(outcome, note) => onApproval(item.approval!.id, outcome, note)} /> : null}</div>
                 const participant = meeting.participants.find(entry => entry.id === item.speakerId)
                 const avatar = item.avatar || participant?.avatar || (item.kind === 'user' ? human.avatar : item.kind === 'admin' ? administrator.avatar : '🤖')
                 return (
                   <div className="arena-message-row" data-kind={item.kind} key={item.id}>
                     <Avatar value={avatar} name={item.speaker} className="arena-avatar--message" />
                     <div className="arena-message" data-kind={item.kind}>
-                      <div className="arena-message__head"><strong>{item.speaker}</strong><span>{item.model ?? (item.kind === 'user' ? '我' : item.kind === 'admin' ? '群管理员' : '')}{item.phase === 'ack' ? ' · 开始处理' : ''}</span></div>
+                      <div className="arena-message__head"><strong>{item.speaker}</strong><span>{item.model ?? (item.kind === 'user' ? t("meeting.me") : item.kind === 'admin' ? t("users.group.administrator") : '')}{item.phase === 'ack' ? t("chat.getting.started") : ''}</span></div>
                       <div className="arena-message__text">{item.text}</div>
                     </div>
                   </div>
@@ -1840,16 +1884,16 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
               })}
             </div>
           )}
-          {working.length ? <div className="arena-chat-typing"><div className="arena-typing-stack">{working.slice(0, 4).map(participant => <Avatar key={participant.id} value={participant.avatar} name={participant.name} />)}</div><span>{working.map(item => item.name).join('、')} 正在并行处理</span><WorkingDots /></div> : null}
-          {meeting.status === 'paused' && active ? <div className="arena-chat-system">当前无人发言，会议仍在。你可以发送消息、@成员，或点击“让全员继续”。</div> : null}
-          {meeting.error ? <div className="arena-error">{meeting.error}</div> : null}
-          {error ? <div className="arena-error">{error}</div> : null}
+          {working.length ? <div className="arena-chat-typing"><div className="arena-typing-stack">{working.slice(0, 4).map(participant => <Avatar key={participant.id} value={participant.avatar} name={participant.name} />)}</div><span>{working.map(item => item.name).join('、')} {t("meeting.are.working.in.parallel")}</span><WorkingDots /></div> : null}
+          {meeting.status === 'paused' && active ? <div className="arena-chat-system">{t("meeting.nobody.is.speaking.right.now.but.the.meeting.is")}</div> : null}
+          {meeting.error ? <div className="arena-error">{errorText(meeting.error)}</div> : null}
+          {error ? <div className="arena-error">{errorText(error)}</div> : null}
         </div>
 
         <div
           className="arena-workspace-resizer"
           role="separator"
-          aria-label="调整右侧协作栏宽度"
+          aria-label={t("meeting.resize.the.right.collaboration.panel")}
           aria-orientation="vertical"
           aria-valuemin={280}
           aria-valuemax={620}
@@ -1866,28 +1910,29 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
 
       <div className="arena-controls">
         <div className="arena-intervene arena-intervene--chat">
-          <div className="arena-mention-bar"><span>点名：</span>{meeting.participants.map(participant => { const muted = mutedIds.has(participant.id); return <button type="button" key={participant.id} className={muted ? 'is-muted' : ''} title={muted ? `${participant.name} 已静默，点击生成恢复指令` : `@${participant.name}`} onClick={() => mention(participant.name, muted ? '可以继续说话了 ' : '')}><Avatar value={participant.avatar} name={participant.name} />@{participant.name}{muted ? ' · 静默' : ''}</button> })}<button type="button" className="is-admin" onClick={() => mention(administrator.name)}><Avatar value={administrator.avatar} name={administrator.name} />@{administrator.name}</button></div>
-          <div><textarea className="arena-textarea" value={message} placeholder="自由发言；不 @ 时未静默的 AI 会同时工作；也可说“某某别说话”…" maxLength={4000} onChange={event => setMessage(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="arena-send" type="button" disabled={busy || !message.trim()} onClick={() => void send()}>发送</button></div>
+          <div className="arena-mention-bar"><span>{t("chat.mention")}</span>{meeting.participants.map(participant => { const muted = mutedIds.has(participant.id); return <button type="button" key={participant.id} className={muted ? 'is-muted' : ''} title={muted ? t("chat.value.is.muted.click.to.draft.an.unmute.command", { p0: participant.name }) : `@${participant.name}`} onClick={() => mention(participant.name, muted ? t("chat.you.can.speak.again") : '')}><Avatar value={participant.avatar} name={participant.name} />@{participant.name}{muted ? t("chat.muted") : ''}</button> })}<button type="button" className="is-admin" onClick={() => mention(administrator.name)}><Avatar value={administrator.avatar} name={administrator.name} />@{administrator.name}</button></div>
+          <div><textarea className="arena-textarea" value={message} placeholder={t("meeting.speak.freely.without.mentions.unmuted.ai.users.work.together")} maxLength={4000} onChange={event => setMessage(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button className="arena-send" type="button" disabled={busy || !message.trim()} onClick={() => void send()}>{t("chat.send")}</button></div>
         </div>
         {meeting.status === 'paused' ? (
-          <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'resume' })}>▶ 让全员继续</button>
-        ) : meeting.status === 'running' ? <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'pause' })}>Ⅱ 本轮后暂停</button> : null}
-        <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'summarize' })}>📋 生成阶段总结</button>
-        <button className="arena-control arena-control--danger" type="button" disabled={busy || !busyMeeting} onClick={() => void act({ action: 'stop' })}>■ 停止当前工作</button>
+          <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'resume' })}>{t("meeting.continue.with.everyone")}</button>
+        ) : meeting.status === 'running' ? <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'pause' })}>{t("meeting.pause.after.this.turn")}</button> : null}
+        <button className="arena-control" type="button" disabled={busy} onClick={() => void act({ action: 'summarize' })}>{t("meeting.summarize.progress")}</button>
+        <button className="arena-control arena-control--danger" type="button" disabled={busy || !busyMeeting} onClick={() => void act({ action: 'stop' })}>{t("meeting.stop.current.work")}</button>
       </div>
     </div>
   )
 }
 
 export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}): ReactNode {
+  const language = useArenaLocale()
   const [open, setOpen] = useState(embedded)
   const [state, setState] = useState<ArenaState>({
     meetings: [],
     rooms: [],
     templates: FALLBACK_TEMPLATES,
     profiles: {
-      human: { id: 'human', name: '你', avatar: '🧑' },
-      administrator: { id: 'administrator', name: '管理员', avatar: '🛡️' },
+      human: { id: 'human', name: t("users.you"), avatar: '🧑' },
+      administrator: { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' },
       aiUsers: [],
     },
     modelCatalog: [],
@@ -1897,7 +1942,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   const [chatType, setChatType] = useState<'direct' | 'group'>('direct')
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('meeting')
   const [view, setView] = useState<ArenaView>('setup')
-  const [loadError, setLoadError] = useState('')
+  const [loadError, setLoadError] = useState<UiNotice>('')
 
   const selected = useMemo(
     () => state.meetings.find(meeting => meeting.id === selectedId) ?? null,
@@ -1925,7 +1970,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
         setState(data)
         setLoadError('')
       } catch (cause) {
-        if (alive) setLoadError(cause instanceof Error ? cause.message : String(cause))
+        if (alive) setLoadError(captureError(cause))
       }
     }
     void refresh()
@@ -1971,7 +2016,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     ...current,
     profiles: {
       human: profile,
-      administrator: current.profiles?.administrator ?? { id: 'administrator', name: '管理员', avatar: '🛡️' },
+      administrator: current.profiles?.administrator ?? { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' },
       aiUsers: current.profiles?.aiUsers ?? [],
     },
   }))
@@ -1979,27 +2024,27 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   const administratorSaved = (profile: UserProfile): void => setState(current => ({
     ...current,
     profiles: {
-      human: current.profiles?.human ?? { id: 'human', name: '你', avatar: '🧑' },
+      human: current.profiles?.human ?? { id: 'human', name: t("users.you"), avatar: '🧑' },
       administrator: profile,
       aiUsers: current.profiles?.aiUsers ?? [],
     },
   }))
 
   const aiSaved = (profile: UserProfile): void => setState(current => {
-    const human = current.profiles?.human ?? { id: 'human', name: '你', avatar: '🧑' }
+    const human = current.profiles?.human ?? { id: 'human', name: t("users.you"), avatar: '🧑' }
     const aiUsers = [...(current.profiles?.aiUsers ?? [])]
     const index = aiUsers.findIndex(item => item.id === profile.id)
     if (index >= 0) aiUsers.splice(index, 1, profile)
     else aiUsers.push(profile)
-    const administrator = current.profiles?.administrator ?? { id: 'administrator', name: '管理员', avatar: '🛡️' }
+    const administrator = current.profiles?.administrator ?? { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' }
     return { ...current, profiles: { human, administrator, aiUsers } }
   })
 
   const aiDeleted = (id: string): void => setState(current => ({
     ...current,
     profiles: {
-      human: current.profiles?.human ?? { id: 'human', name: '你', avatar: '🧑' },
-      administrator: current.profiles?.administrator ?? { id: 'administrator', name: '管理员', avatar: '🛡️' },
+      human: current.profiles?.human ?? { id: 'human', name: t("users.you"), avatar: '🧑' },
+      administrator: current.profiles?.administrator ?? { id: 'administrator', name: t("users.administrator"), avatar: '🛡️' },
       aiUsers: (current.profiles?.aiUsers ?? []).filter(item => item.id !== id),
     },
   }))
@@ -2051,10 +2096,18 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     await renameRoomRecord(selectedRoom.id, name)
   }
 
-  const setSelectedRoomWorkdir = async (workdir: string): Promise<void> => {
-    if (!selectedRoom) return
+  const setSelectedRoomWorkdir = async (workdir: string): Promise<string> => {
+    if (!selectedRoom) throw new Error(t("arena.select.a.chat.first"))
     const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}`, { method: 'PATCH', body: JSON.stringify({ workdir }) })
-    setState(current => ({ ...current, rooms: (current.rooms ?? []).map(room => room.id === selectedRoom.id ? result.room : room) }))
+    setState(current => ({ ...current, rooms: (current.rooms ?? []).map(room => room.id === result.room.id ? result.room : room) }))
+    return result.room.workdir ?? ''
+  }
+
+  const setSelectedMeetingWorkdir = async (workdir: string): Promise<string> => {
+    if (!selected) throw new Error(t("arena.select.a.meeting.first"))
+    const result = await jsonRequest<{ meeting: Meeting }>(`/meetings/${encodeURIComponent(selected.id)}`, { method: 'PATCH', body: JSON.stringify({ workdir }) })
+    setState(current => ({ ...current, meetings: current.meetings.map(meeting => meeting.id === result.meeting.id ? result.meeting : meeting) }))
+    return result.meeting.workdir ?? ''
   }
 
   const inviteRoomMembers = async (profileIds: string[]): Promise<void> => {
@@ -2112,41 +2165,41 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   return (
     <>
       {open ? (
-        <div className="arena-backdrop" data-embedded={embedded} role="presentation" onMouseDown={event => { if (!embedded && event.target === event.currentTarget) setOpen(false) }}>
+        <div className="arena-backdrop" lang={language === 'zh' ? 'zh-CN' : 'en'} data-embedded={embedded} role="presentation" onMouseDown={event => { if (!embedded && event.target === event.currentTarget) setOpen(false) }}>
           <section className="arena-modal" role="dialog" aria-modal={!embedded} aria-label="Agent Arena">
             <header className="arena-header">
               <div className="arena-topbar">
                 <div className="arena-brand">
                   <span className="arena-brand__mark">⚔</span>
-                  <span className="arena-brand__text"><strong>Agent Arena</strong><span>AI 社交与多模型会议模式</span></span>
+                  <span className="arena-brand__text"><strong>Agent Arena</strong><span>{t("arena.ai.social.and.multi.model.collaboration")}</span></span>
                 </div>
                 <div className="arena-topbar__spacer" />
-                {activeCount > 0 ? <span className="arena-running-badge">● {activeCount} 场会议进行中</span> : null}
-                {!embedded ? <button className="arena-exit" type="button" onClick={() => setOpen(false)}>退出 Arena</button> : null}
+                {activeCount > 0 ? <span className="arena-running-badge">● {t("counts.activeMeetings", { count: activeCount })}</span> : null}
+                {!embedded ? <button className="arena-exit" type="button" onClick={() => setOpen(false)}>{t("arena.exit.arena")}</button> : null}
               </div>
-              <nav className="arena-mode-nav" aria-label="Arena 模式切换">
+              <nav className="arena-mode-nav" aria-label={t("arena.arena.modes")}>
                 <button type="button" className={view !== 'history' && activeMode === 'meeting' ? 'is-active' : ''} onClick={() => switchMode('meeting')}>
-                  <span>⚔️</span><strong>协作会议</strong><small>多 AI 讨论与工作</small>
+                  <span>⚔️</span><strong>{t("history.meetings")}</strong><small>{t("arena.multi.ai.discussion.and.work")}</small>
                 </button>
                 <button type="button" className={view !== 'history' && activeMode === 'direct' ? 'is-active' : ''} onClick={() => switchMode('direct')}>
-                  <span>💬</span><strong>AI 私聊</strong><small>与一个角色对话</small>
+                  <span>💬</span><strong>{t("history.ai.direct.chats")}</strong><small>{t("arena.talk.to.one.character")}</small>
                 </button>
                 <button type="button" className={view !== 'history' && activeMode === 'group' ? 'is-active' : ''} onClick={() => switchMode('group')}>
-                  <span>👥</span><strong>AI 群聊</strong><small>2–12 个 AI 同场</small>
+                  <span>👥</span><strong>{t("history.ai.group.chats")}</strong><small>{t("arena.2.12.ai.users.together")}</small>
                 </button>
                 <button type="button" className={view !== 'history' && activeMode === 'profiles' ? 'is-active' : ''} onClick={() => switchMode('profiles')}>
-                  <span>🪪</span><strong>用户中心</strong><small>头像、人格与模型</small>
+                  <span>🪪</span><strong>{t("arena.users")}</strong><small>{t("arena.avatars.personas.and.models")}</small>
                 </button>
                 <button type="button" className={view === 'settings' ? 'is-active' : ''} onClick={() => setView('settings')}>
-                  <span>⚙️</span><strong>协作设置</strong><small>限流与自动接话</small>
+                  <span>⚙️</span><strong>{t("arena.settings")}</strong><small>{t("arena.rate.limits.and.automatic.replies")}</small>
                 </button>
                 <button type="button" className={view === 'history' ? 'is-active' : ''} onClick={openHistory}>
-                  <span>🗂️</span><strong>历史管理</strong><small>重命名与删除</small>
+                  <span>🗂️</span><strong>{t("arena.history")}</strong><small>{t("arena.rename.and.delete")}</small>
                 </button>
               </nav>
               {view !== 'history' && activeMode !== 'profiles' && ((activeMode === 'meeting' && state.meetings.length > 0) || (activeMode !== 'meeting' && modeRooms.length > 0)) ? (
                 <div className="arena-recent-strip">
-                  <span>最近</span>
+                  <span>{t("arena.recent")}</span>
                   {activeMode === 'meeting' ? state.meetings.slice(0, 8).map(meeting => (
                     <button type="button" key={meeting.id} className={view === 'watch' && selectedId === meeting.id ? 'is-active' : ''} onClick={() => { setSelectedId(meeting.id); setView('watch') }}>
                       <i className="arena-dot" data-active={BUSY_MEETINGS.has(meeting.status)} />{meetingTitle(meeting)}
@@ -2161,7 +2214,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
             </header>
             <div className="arena-body">
               <main className="arena-main">
-                {loadError ? <div className="arena-global-alert" role="alert">连接 Arena 服务失败：{loadError}</div> : null}
+                {loadError ? <div className="arena-global-alert" role="alert">{t("arena.unable.to.connect.to.arena")}{errorText(loadError)}</div> : null}
                 {view === 'history' ? (
                   <HistoryView
                     meetings={state.meetings}
@@ -2201,7 +2254,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                     onCreated={created}
                   />
                 ) : (
-                  <WatchView meeting={selected} profiles={state.profiles} onAction={runAction} onApproval={resolveApproval} />
+                  <WatchView meeting={selected} profiles={state.profiles} onAction={runAction} onApproval={resolveApproval} onSetWorkdir={setSelectedMeetingWorkdir} />
                 )}
               </main>
             </div>
@@ -2212,9 +2265,10 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
   )
 }
 
-export const inject = ['slots']
+export const inject = ['slots', 'locale']
 
 export function apply(ctx: any): void {
+  ctx.effect(() => installArenaLocale(ctx.locale), 'agent-arena: dictionaries')
   ctx.effect(() => {
     const style = document.createElement('style')
     style.dataset.dshAgentArena = ''
@@ -2239,6 +2293,6 @@ export function apply(ctx: any): void {
     name: 'conversation.view',
     id: 'agent-arena',
     order: 5,
-    label: 'AI 协作',
+    label: () => t("arena.ai.collaboration"),
   }, () => <ArenaOverlay embedded />))
 }

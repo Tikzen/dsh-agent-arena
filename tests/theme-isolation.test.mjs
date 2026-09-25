@@ -76,3 +76,21 @@ test('the stylesheet stays agnostic to any particular theme plugin', () => {
     )
   }
 })
+
+test('the modal does not let header content widen its single grid column', () => {
+  const modal = rules(arenaCss()).find(rule => rule.selector === '.arena-modal')
+  const header = rules(arenaCss()).find(rule => rule.selector === '.arena-header')
+  assert.match(modal.declarations, /grid-template-columns:\s*minmax\(0,\s*1fr\)/)
+  assert.match(header.declarations, /min-width:\s*0/)
+})
+
+test('narrow meetings keep translated controls reachable without overlapping chat and boards', () => {
+  const narrow = arenaCss().split('@media (max-width: 760px)')[1].split('@media (max-height: 520px)')[0]
+  const declarations = selector => rules(narrow).find(rule => rule.selector === selector)?.declarations ?? ''
+  assert.match(declarations('.arena-watch'), /overflow-y:\s*auto/)
+  assert.match(declarations('.arena-watch-head'), /height:\s*auto/)
+  assert.match(declarations('.arena-watch-head__actions'), /max-width:\s*100%/)
+  assert.match(declarations('.arena-collab-layout'), /grid-template-rows:\s*minmax\(220px,\s*50vh\)\s*minmax\(270px,\s*42vh\)/)
+  assert.match(declarations('.arena-collab-layout .arena-stage'), /overflow:\s*auto/)
+  assert.match(declarations('.arena-controls'), /flex:\s*none/)
+})
