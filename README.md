@@ -1,5 +1,7 @@
 # dsh-agent-arena
 
+<p align="right"><a href="README.en.md">English version</a></p>
+
 把几位 AI 和人类用户放进同一个持续协作群：大家像在 QQ 群里一样连续发言、并行处理任务并使用工具完成工作。人类可以随时自由发言、@指定 AI、@管理员调整会议，并在右侧协作控制台管理任务、方案与成果。
 
 <p align="center">
