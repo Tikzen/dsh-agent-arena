@@ -207,7 +207,7 @@ AI 完成文件、链接、结论或阶段总结后，可以登记到成果库�
 
 - Node.js 22 或更高版本
 - DeepSeek Harness Web profile
-- v0.5.0 的语言切换依赖 DSH 原生 locale 服务；本版本在 DSH `0.1.1-rc.2` 上完成本地验收
+- v0.5.0 的语言切换依赖 DSH 原生 locale 服务；已在 DSH `0.1.1-rc.2` 和独立的 Web `0.1.7-rc.2` 实例中验证界面；Web `0.1.5-rc.2` 使用下方的专用兼容版
 - 至少一个已经在 DSH 设置中配置好的模型供应商
 
 ## 安装
@@ -237,6 +237,21 @@ npm run build
 ```powershell
 <DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.5.0"
 ```
+
+### DSH Web 版本对应
+
+| DSH Web 版本 | Agent Arena 安装版本 | 说明 |
+| --- | --- | --- |
+| `0.1.7-rc.2` | `v0.5.0` | 首页入口、会议表单、用户中心、协作设置与原生语言切换已在独立实例验证。 |
+| `0.1.5-rc.2` | `v0.5.0-dsh015.1` | 专用兼容版；旧版未创建会话时不渲染会话输入插槽，补上主页的完整入口。 |
+
+安装 `0.1.5-rc.2` 专用版时，将上述命令的 tag 换为 `v0.5.0-dsh015.1`：
+
+```powershell
+<DSH 安装目录>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.5.0-dsh015.1"
+```
+
+两个版本均以独立 Web profile、未配置真实模型密钥进行验证：插件载入、主页入口、打开 Arena 和可用的表单/设置交互已通过；实际模型发言、工具执行和审批流程尚未在这两个版本上做端到端验收。这里的 `0.1.5` 与 `0.1.7` 均指已发布的 `rc.2`，不代表正式版或桌面版。
 
 如果希望直接跟随 `main` 分支的最新开发版本：
 
