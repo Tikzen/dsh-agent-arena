@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent } from 'react'
+import { createPortal } from 'react-dom'
 import { BRAND_LOGOS } from './brand-logos.generated'
 import type { BrandLogoId } from './brand-logos.generated'
 import { CUSTOM_BRAND_IMAGES } from './custom-brand-images'
@@ -571,10 +572,10 @@ function AvatarEditor(props: { value: string; name: string; onChange: (value: st
   )
 }
 
-export function ArenaHomeLaunch(): ReactNode {
+export function ArenaHomeLaunch({ legacy = false }: { legacy?: boolean } = {}): ReactNode {
   useArenaLocale()
   return (
-    <div className="arena-home-launch">
+    <div className={`arena-home-launch${legacy ? ' arena-home-launch--legacy' : ''}`}>
       <button className="arena-home-launch__inner" type="button" onClick={openArena}>
         <span className="arena-home-launch__icon">⚔️</span>
         <span className="arena-home-launch__copy">
@@ -585,6 +586,26 @@ export function ArenaHomeLaunch(): ReactNode {
       </button>
     </div>
   )
+}
+
+// DSH 0.1.5 renders the empty-session hero before a session-scoped input dock
+// exists. Put the same full-width launch card in the hero's own layout until
+// the normal dock provides it; keep this out of the shell's corner controls.
+export function ArenaLegacyHeroLaunch(): ReactNode {
+  const [target, setTarget] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    const update = (): void => {
+      const hero = document.querySelector('[data-phase="hero"]')
+      const nativeLaunch = hero?.querySelector('.arena-home-launch:not(.arena-home-launch--legacy)')
+      const composer = hero?.querySelector<HTMLElement>('[data-composer-seat] [class*="_composerHero"]')
+      setTarget(nativeLaunch ? null : composer ?? null)
+    }
+    const observer = new MutationObserver(update)
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-phase'] })
+    update()
+    return () => observer.disconnect()
+  }, [])
+  return target ? createPortal(<ArenaHomeLaunch legacy />, target) : null
 }
 
 function WorkingDots(): ReactNode {
@@ -2288,6 +2309,12 @@ export function apply(ctx: any): void {
     id: 'agent-arena-overlay',
     order: 50,
   }, ArenaOverlay))
+
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'agent-arena-legacy-home',
+    order: 51,
+  }, ArenaLegacyHeroLaunch))
 
   ctx.slots.inject('conversation.view', () => ctx.slots.register({
     name: 'conversation.view',
