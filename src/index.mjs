@@ -5,8 +5,11 @@ import { join, resolve } from 'node:path'
 import { conversationSettingsPatch, normalizeCoordinationFile, normalizeRoomWorkdir, runtimeWorkdir } from './workspace.mjs'
 import {
   API_ROOT,
+  ARENA_CAPABILITY_KEYS,
   ARENA_TEMPLATES,
   ensureMeetingWorkspace,
+  estimateMeetingContext,
+  getMeetingContextState,
   isDuplicateAutonomousMessage,
   isArenaSessionPrompt,
   MEETING_STAGES,
@@ -14,6 +17,8 @@ import {
   cleanAvatar,
   mentionedProfileIds,
   mentionsAdministrator,
+  normalizeCapabilities,
+  normalizeCompressionMode,
   parseSpeechDirectives,
   publicMeeting,
   renderPersonaTemplate,
@@ -169,6 +174,21 @@ function transcriptText(items, emptyText = '（还没有消息）') {
   return text.length > 24_000 ? text.slice(-24_000) : (text || emptyText)
 }
 
+function meetingContextText(meeting, profileId = null, afterMessageId = null) {
+  ensureMeetingWorkspace(meeting)
+  const visible = (meeting.transcript ?? []).filter(item => item.kind !== 'system')
+  const state = getMeetingContextState(meeting, profileId)
+  const index = state.compressedThroughId
+    ? visible.findIndex(item => item.id === state.compressedThroughId)
+    : -1
+  const deliveredIndex = afterMessageId ? visible.findIndex(item => item.id === afterMessageId) : -1
+  const recent = deliveredIndex >= 0 ? visible.slice(deliveredIndex + 1) : index >= 0 ? visible.slice(index + 1) : visible
+  return [
+    deliveredIndex < 0 && index >= 0 && state.summary ? `较早讨论的压缩摘要（原记录仍可在聊天区查看）：\n${state.summary}` : '',
+    `最近消息：\n${transcriptText(recent)}`,
+  ].filter(Boolean).join('\n\n')
+}
+
 function meetingWorkspaceText(meeting) {
   ensureMeetingWorkspace(meeting)
   const participantName = id => meeting.participants?.find(item => item.id === id)?.name || (id === 'administrator' ? meeting.administratorProfile?.name : '') || '未分配'
@@ -184,7 +204,8 @@ function meetingWorkspaceText(meeting) {
   return [`当前协作阶段：${meeting.collaborationStage}`, '任务板：', tasks, '决策板：', decisions, '成果板：', artifacts].join('\n')
 }
 
-function participantPrompt(meeting, participant, coordinationText = '') {
+function participantPrompt(meeting, participant, coordinationText = '', afterMessageId = null) {
+  const assignedTask = meeting.tasks?.find(item => item.id === meeting.run?.currentTaskId && item.assigneeId === participant.id)
   return [
     `你正在“${meeting.topic}”协作群中，显示名称是 ${participant.name}。`,
     `你的人格与职责：${participant.role || '独立思考，主动推进问题并给出有依据的建议。'}`,
@@ -194,13 +215,14 @@ function participantPrompt(meeting, participant, coordinationText = '') {
     '公开发言时使用 arena_send_message。发一条还是多条、每条多长，都由你结合人格、语义和任务自然决定：能一条说清就发一条，需要自然分步、报告真实进度或补交最终结果时可以连续发送。绝对不要按字数、句号或固定模板机械切分。',
     '每次 arena_send_message 调用都会立刻显示在群聊中；调用过后不要在最终回答中重复这些公开内容。不要添加自己的姓名前缀，插件不限制输出 token。',
     '会议右侧有共享协作控制台。需要拆分或认领工作时更新任务板；出现多个可选方案时创建决策并留下理由、风险和信心；产出文件、链接或结论后登记到成果板。不要把这些结构化更新只写在聊天气泡里。',
+    assignedTask ? `当前由人类启动的任务：${assignedTask.title}。${assignedTask.description || ''} 请执行可行步骤、及时汇报真实进展，并更新任务状态；受阻时明确说明。` : '',
     coordinationText,
     '',
     '当前协作控制台：',
     meetingWorkspaceText(meeting),
     '',
     '当前群聊记录：',
-    transcriptText(meeting.transcript),
+    meetingContextText(meeting, participant.id, afterMessageId),
   ].join('\n')
 }
 
@@ -323,6 +345,7 @@ export function apply(ctx, config = {}) {
       role: '维护协作秩序，并按人类用户的要求安全地调整话题、协作阶段与决策状态。',
       provider: '',
       model: '',
+      compressionMode: 'dsh',
     },
     aiUsers: [],
   }
@@ -366,6 +389,16 @@ export function apply(ctx, config = {}) {
         currentToolI18n: current?.currentToolI18n,
         detail: current?.detail || '',
         currentTool: current?.currentTool || '',
+        stats: {
+          requests: Number(current?.stats?.requests) || 0,
+          inputTokens: Number(current?.stats?.inputTokens) || 0,
+          outputTokens: Number(current?.stats?.outputTokens) || 0,
+          failures: Number(current?.stats?.failures) || 0,
+          retries: Number(current?.stats?.retries) || 0,
+          intentChecks: Number(current?.stats?.intentChecks) || 0,
+          lastInputTokens: Number(current?.stats?.lastInputTokens) || 0,
+          lastDurationMs: Number(current?.stats?.lastDurationMs) || 0,
+        },
         claimedFiles: Array.isArray(current?.claimedFiles) ? current.claimedFiles.slice(0, 20) : [],
         history: Array.isArray(current?.history)
           ? current.history.slice(-2000)
@@ -574,6 +607,7 @@ export function apply(ctx, config = {}) {
       role = {
         profileId: profile.id, name: profile.name, avatar: profile.avatar, model: profile.model || '',
         status: 'idle', stage: '等待任务', detail: '', currentTool: '', claimedFiles: [], history: [], recent: [], updatedAt: nowIso(),
+        stats: { requests: 0, inputTokens: 0, outputTokens: 0, failures: 0, retries: 0, intentChecks: 0, lastInputTokens: 0, lastDurationMs: 0 },
       }
       monitor.roles.push(role)
     }
@@ -607,6 +641,27 @@ export function apply(ctx, config = {}) {
       }
     }
     container.activityMonitor.updatedAt = timestamp
+  }
+
+  function updateRun(meeting, status, phase = status, taskId = meeting.run?.currentTaskId || null) {
+    ensureMeetingWorkspace(meeting)
+    meeting.run = {
+      ...meeting.run,
+      id: meeting.run.id || randomUUID(),
+      status, phase, currentTaskId: taskId,
+      startedAt: meeting.run.startedAt || nowIso(), updatedAt: nowIso(),
+    }
+  }
+
+  function recordRequest(context, patch) {
+    if (!context?.container || !context?.profile) return
+    const role = roleActivity(context.container, context.profile)
+    for (const [key, amount] of Object.entries(patch)) {
+      role.stats[key] = Math.max(0, (role.stats[key] || 0) + amount)
+    }
+    role.updatedAt = nowIso()
+    context.container.activityMonitor.updatedAt = role.updatedAt
+    void persist().catch(() => undefined)
   }
 
   function coordinationBoard(runtime, selfId) {
@@ -835,6 +890,10 @@ export function apply(ctx, config = {}) {
     agentCtx.tools.register(coordinationTool(runtime, profile))
     agentCtx.tools.register(autonomousMessageTool(runtime, profile))
     agentCtx.tools.guard(exec => {
+      const category = capabilityCategory(exec.name)
+      if (category && !capabilityFor(runtime.container, profile.id)[category]) {
+        return `Agent Arena: ${profile.name} 的 ${category} 能力已被此对话关闭。请请求人类在角色能力设置中开启。`
+      }
       const files = mutationTargets(exec.name, exec.arguments).map(file => normalizeCoordinationFile(file, runtime.workdir)).filter(Boolean)
       if (!files.length) return undefined
       runtime.fileClaims ??= new Map()
@@ -940,8 +999,8 @@ export function apply(ctx, config = {}) {
         cooldownErrorStatuses: normalizeArenaCooldownStatuses(stored.profiles.settings.cooldownErrorStatuses),
         autoReplyEnabled: stored.profiles.settings.autoReplyEnabled !== false,
       }
-      if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator' }
-      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model).map(item => ({ ...item, autoReplyDisabled: item.autoReplyDisabled === true }))
+      if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator', compressionMode: normalizeCompressionMode(stored.profiles.administrator.compressionMode) }
+      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model).map(item => ({ ...item, compressionMode: normalizeCompressionMode(item.compressionMode), autoReplyDisabled: item.autoReplyDisabled === true, capabilities: normalizeCapabilities(item.capabilities) }))
       for (const room of Array.isArray(stored?.rooms) ? stored.rooms : []) {
         if (!room?.id) continue
         if (room.type === 'group' && !room.administratorProfile) {
@@ -958,8 +1017,12 @@ export function apply(ctx, config = {}) {
         }
         room.mutedParticipantIds = Array.isArray(room.mutedParticipantIds) ? room.mutedParticipantIds : []
         room.permissions = room.permissions && typeof room.permissions === 'object' ? room.permissions : {}
+        room.capabilities = room.capabilities && typeof room.capabilities === 'object' ? room.capabilities : {}
         room.workdir = typeof room.workdir === 'string' ? room.workdir.trim() : ''
-        for (const participant of permissionProfiles(room)) room.permissions[participant.id] = normalizePermissionMode(room.permissions[participant.id])
+        for (const participant of permissionProfiles(room)) {
+          room.permissions[participant.id] = normalizePermissionMode(room.permissions[participant.id])
+          room.capabilities[participant.id] = normalizeCapabilities(room.capabilities[participant.id] ?? participant.capabilities)
+        }
         for (const message of room.messages ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         room.respondingProfileIds = Array.isArray(room.respondingProfileIds) ? room.respondingProfileIds : []
         const roomMonitor = ensureActivityMonitor(room)
@@ -977,6 +1040,14 @@ export function apply(ctx, config = {}) {
         if (!meeting?.id) continue
         if (!Array.isArray(meeting.tasks) || !Array.isArray(meeting.decisions) || !Array.isArray(meeting.artifacts) || !MEETING_STAGES.includes(meeting.collaborationStage)) recovered = true
         ensureMeetingWorkspace(meeting)
+        meeting.administratorProfile.compressionMode = normalizeCompressionMode(meeting.administratorProfile.compressionMode ?? profiles.administrator.compressionMode)
+        for (const participant of meeting.participants ?? []) participant.compressionMode = normalizeCompressionMode(participant.compressionMode ?? profiles.aiUsers.find(item => item.id === participant.id)?.compressionMode)
+        if (['running', 'queued'].includes(meeting.run.status)) {
+          meeting.run.status = 'paused'
+          meeting.run.phase = 'interrupted'
+          meeting.run.updatedAt = nowIso()
+          recovered = true
+        }
         if (BUSY_MEETING_STATUSES.has(meeting.status) || LEGACY_TERMINAL_STATUSES.has(meeting.status)) {
           recovered = true
           meeting.status = 'paused'
@@ -987,8 +1058,12 @@ export function apply(ctx, config = {}) {
         }
         meeting.mutedParticipantIds = Array.isArray(meeting.mutedParticipantIds) ? meeting.mutedParticipantIds : []
         meeting.permissions = meeting.permissions && typeof meeting.permissions === 'object' ? meeting.permissions : {}
+        meeting.capabilities = meeting.capabilities && typeof meeting.capabilities === 'object' ? meeting.capabilities : {}
         meeting.workdir = typeof meeting.workdir === 'string' ? meeting.workdir.trim() : ''
-        for (const participant of permissionProfiles(meeting)) meeting.permissions[participant.id] = normalizePermissionMode(meeting.permissions[participant.id])
+        for (const participant of permissionProfiles(meeting)) {
+          meeting.permissions[participant.id] = normalizePermissionMode(meeting.permissions[participant.id])
+          meeting.capabilities[participant.id] = normalizeCapabilities(meeting.capabilities[participant.id] ?? participant.capabilities)
+        }
         for (const message of meeting.transcript ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         const meetingMonitor = ensureActivityMonitor(meeting)
         for (const role of meetingMonitor.roles) {
@@ -1020,7 +1095,7 @@ export function apply(ctx, config = {}) {
       if (provider.id === selection.provider && !models.some(model => model.id === selection.model)) {
         models.unshift({ provider: provider.id, id: selection.model, name: selection.model })
       }
-      return { id: provider.id, name: provider.name, models: models.map(model => ({ id: model.id, name: model.name, description: model.description })) }
+      return { id: provider.id, name: provider.name, models: models.map(model => ({ id: model.id, name: model.name, description: model.description, contextWindow: model.contextWindow })) }
     }))
     catalogCache = { expiresAt: Date.now() + 10_000, value }
     return value
@@ -1050,10 +1125,12 @@ export function apply(ctx, config = {}) {
   async function saveAdministratorProfile(raw) {
     const base = validateProfileBase(raw, '🛡️')
     const model = validateModel(raw)
+    if (raw.compressionMode != null && !['dsh', 'server'].includes(raw.compressionMode)) throw new HttpError(400, uiMessage("users.choose.compression.mode"))
     profiles.administrator = {
       id: 'administrator',
       ...base,
       ...model,
+      compressionMode: normalizeCompressionMode(raw.compressionMode),
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       updatedAt: nowIso(),
     }
@@ -1091,13 +1168,16 @@ export function apply(ctx, config = {}) {
     const model = validateModel(raw)
     const requestedId = typeof raw.id === 'string' ? raw.id.trim() : ''
     const existingIndex = profiles.aiUsers.findIndex(item => item.id === requestedId)
+    if ((existingIndex < 0 && !['dsh', 'server'].includes(raw.compressionMode)) || (raw.compressionMode != null && !['dsh', 'server'].includes(raw.compressionMode))) throw new HttpError(400, uiMessage("users.choose.compression.mode"))
     const profile = {
       id: existingIndex >= 0 ? requestedId : randomUUID(),
       ...base,
       ...model,
+      compressionMode: normalizeCompressionMode(raw.compressionMode ?? profiles.aiUsers[existingIndex]?.compressionMode),
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       presetPrompts: (Array.isArray(raw.presetPrompts) ? raw.presetPrompts : []).map(item => typeof item === 'string' ? item.trim().slice(0, 240) : '').filter(Boolean).slice(0, 8),
       autoReplyDisabled: raw.autoReplyDisabled === true,
+      capabilities: normalizeCapabilities(raw.capabilities),
       color: /^#[0-9a-f]{6}$/i.test(String(raw.color ?? '')) ? String(raw.color) : '#6f5ee8',
       updatedAt: nowIso(),
     }
@@ -1156,6 +1236,86 @@ export function apply(ctx, config = {}) {
     return modelSelection(latest)
   }
 
+  function contextWindowFor(profile) {
+    const selection = liveModelSelection(profile)
+    const model = catalogCache.value.find(item => item.id === selection.provider)?.models.find(item => item.id === selection.model)
+    return Number(model?.contextWindow) || null
+  }
+
+  function contextProfilesFor(meeting) {
+    return [
+      { id: 'administrator', profile: meeting.administratorProfile },
+      ...(meeting.participants ?? []).map(profile => ({ id: profile.id, profile })),
+    ].filter(item => item.profile?.id)
+  }
+
+  function contextSnapshotFor(meeting) {
+    ensureMeetingWorkspace(meeting)
+    const runtime = runtimes.get(meeting.id)
+    return contextProfilesFor(meeting).map(({ id, profile }) => {
+      const state = getMeetingContextState(meeting, id)
+      const estimate = estimateMeetingContext(meeting, contextWindowFor(profile), id)
+      return {
+        profileId: id,
+        name: profile.name,
+        avatar: profile.avatar,
+        provider: profile.provider,
+        model: profile.model,
+        compressionMode: normalizeCompressionMode(profile.compressionMode),
+        active: Boolean(runtime?.roleAgents?.has(id)),
+        ...estimate,
+        summary: state.summary,
+        summaryUpdatedAt: state.summaryUpdatedAt,
+        compressionCount: state.compressionCount,
+      }
+    })
+  }
+
+  async function compactRoleSession(meeting, profileId, signal) {
+    const profile = contextProfilesFor(meeting).find(item => item.id === profileId)?.profile
+    if (!profile) throw new HttpError(400, uiMessage("actonmeeting.invalid.context.profile"))
+    if (normalizeCompressionMode(profile.compressionMode) === 'server') throw new HttpError(409, uiMessage("board.context.server.no.manual"))
+    const runtime = runtimes.get(meeting.id)
+    const pending = runtime?.roleAgents?.get(profileId)
+    if (!pending) throw new HttpError(409, uiMessage("board.context.no.active.session"))
+    const handle = await pending
+    // DSH 0.1.7 mounts compaction inside each Agent Preset, not on the web host.
+    const engine = handle.agent?.ctx?.get?.('compaction') ?? ctx.get('compaction')
+    if (!engine?.compactNow) throw new HttpError(503, uiMessage("board.context.native.unavailable"))
+    let result
+    try { result = await engine.compactNow(handle.agent, signal) }
+    catch (error) { throw new HttpError(409, safeError(error)) }
+    if (!result) throw new HttpError(409, uiMessage("actonmeeting.there.is.not.enough.context.to.compress"))
+    const state = meeting.contextByProfile[profileId]
+    state.summary = messageText(result.summary).slice(-6000)
+    state.summaryUpdatedAt = nowIso()
+    state.compressionCount += 1
+    meeting.contextCompressionCount += 1
+    runtime.lastNativeCompressionMessageCounts ??= new Map()
+    runtime.lastNativeCompressionMessageCounts.set(profileId, (meeting.transcript ?? []).filter(item => item.kind !== 'system').length)
+    const role = meeting.activityMonitor?.roles?.find(item => item.profileId === profileId)
+    if (role?.stats) role.stats.lastInputTokens = 0
+    return true
+  }
+
+  async function maybeAutoCompressMeeting(meeting, profile, runtime, handle) {
+    ensureMeetingWorkspace(meeting)
+    if (normalizeCompressionMode(profile?.compressionMode) === 'server') return false
+    if (!meeting.contextSettings.autoCompressEnabled) return false
+    const visibleCount = (meeting.transcript ?? []).filter(item => item.kind !== 'system').length
+    const lastCompressedAt = runtime.lastNativeCompressionMessageCounts?.get(profile.id)
+    if (lastCompressedAt !== undefined && visibleCount - lastCompressedAt < 12) return false
+    // Keep the fallback internal: the UI never presents it as model metadata.
+    const usage = estimateMeetingContext(meeting, contextWindowFor(profile) || 7_500, profile?.id)
+    if (usage.percent < meeting.contextSettings.autoCompressThreshold) return false
+    if (!runtime.roleContextDelivered?.has(profile.id)) return false
+    try { return await compactRoleSession(meeting, profile.id, runtime.abort.signal) }
+    catch (error) {
+      setRoleActivity(meeting, profile, { status: 'error', stage: uiMessage("board.context.native.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
+      return false
+    }
+  }
+
   function normalizePermissionMode(value) {
     const mode = String(value || '')
     return AGENT_PERMISSION_MODES.includes(mode) ? mode : 'danger-full-access'
@@ -1163,6 +1323,22 @@ export function apply(ctx, config = {}) {
 
   function permissionFor(container, profileId) {
     return normalizePermissionMode(container?.permissions?.[profileId])
+  }
+
+  function capabilityFor(container, profileId) {
+    const profile = permissionProfiles(container).find(item => item.id === profileId)
+    return normalizeCapabilities(container?.capabilities?.[profileId] ?? profile?.capabilities)
+  }
+
+  function capabilityCategory(toolName) {
+    const name = String(toolName || '').toLowerCase()
+    if (name.startsWith('arena_')) return 'collaboration'
+    if (/subagent|spawn|delegate|workflow|create_thread/.test(name)) return 'subagents'
+    if (/mcp|skill/.test(name)) return 'skillsMcp'
+    if (/web|browser|fetch|http|url|search_engine/.test(name)) return 'network'
+    if (/exec|shell|bash|pwsh|terminal|command|run_code/.test(name)) return 'terminal'
+    if (/file|read|write|edit|patch|glob|grep|find|search|list/.test(name)) return 'files'
+    return null
   }
 
   function permissionProfiles(container) {
@@ -1349,16 +1525,38 @@ export function apply(ctx, config = {}) {
   function guardedArenaStream(options, next) {
     const selection = { provider: options.provider, model: options.model }
     return (async function* () {
+      const context = arenaSessionContexts.get(String(options.sessionId || ''))
+      const startedAt = Date.now()
+      let usage = null
+      if (context?.countRequest !== false) recordRequest(context, { requests: 1 })
       await waitForChannelCooldown(selection, options.signal)
       const release = await acquireChannel(selection, options.signal)
       try {
         await waitForChannelCooldown(selection, options.signal)
         await reserveChannelRequest(selection, options.signal)
         for await (const chunk of next()) {
-          if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') markChannelFailure(selection, chunk.reason.failure)
+          if (chunk?.type === 'usage' && chunk.usage) usage = chunk.usage
+          if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') {
+            if (context?.countFailure !== false) recordRequest(context, { failures: 1 })
+            markChannelFailure(selection, chunk.reason.failure)
+          }
           yield chunk
         }
+        if (usage) {
+          const inputTokens = (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0) + (Number(usage.cacheWriteTokens) || 0)
+          recordRequest(context, {
+            inputTokens,
+            outputTokens: Number(usage.outputTokens) || 0,
+          })
+          if (context) roleActivity(context.container, context.profile).stats.lastInputTokens = inputTokens
+        }
+        if (context) {
+          const role = roleActivity(context.container, context.profile)
+          role.stats.lastDurationMs = Date.now() - startedAt
+          void persist().catch(() => undefined)
+        }
       } catch (error) {
+        if (context?.countFailure !== false) recordRequest(context, { failures: 1 })
         markChannelFailure(selection, error)
         throw error
       } finally {
@@ -1416,19 +1614,39 @@ export function apply(ctx, config = {}) {
 
   async function startRoleRun({ label, prompt, persona, profile, parent, runtime, outputSchema }) {
     const selection = modelSelection(profile)
-    const run = await ctx.subagents.start('spawn', {
-      label,
-      prompt: [{ type: 'text', text: prompt }],
-      parent: parent.agent,
-      signal: runtime.abort.signal,
-      persona: renderPersonaTemplate(persona, profile?.name || label, profiles.human.name),
-      ...(outputSchema ? { outputSchema } : {}),
-      agentOptions: selection,
-    })
+    const context = { container: runtime.container, runtime, profile, countRequest: false, countFailure: false }
+    recordRequest(context, { requests: 1 })
+    const startedAt = Date.now()
+    let run
+    try {
+      run = await ctx.subagents.start('spawn', {
+        label,
+        prompt: [{ type: 'text', text: prompt }],
+        parent: parent.agent,
+        signal: runtime.abort.signal,
+        persona: renderPersonaTemplate(persona, profile?.name || label, profiles.human.name),
+        ...(outputSchema ? { outputSchema } : {}),
+        agentOptions: selection,
+      })
+    } catch (error) {
+      recordRequest(context, { failures: 1 })
+      throw error
+    }
+    arenaSessionContexts.set(String(run.id), context)
     runtime.activeRuns.add(run)
-    try { return await run.result } finally {
+    try {
+      const result = await run.result
+      if (result.stopReason?.kind === 'error' || result.stopReason === 'error') recordRequest(context, { failures: 1 })
+      return result
+    } catch (error) {
+      recordRequest(context, { failures: 1 })
+      throw error
+    } finally {
+      roleActivity(runtime.container, profile).stats.lastDurationMs = Date.now() - startedAt
+      arenaSessionContexts.delete(String(run.id))
       runtime.activeRuns.delete(run)
       await run.dispose().catch(() => undefined)
+      void persist().catch(() => undefined)
     }
   }
 
@@ -1487,9 +1705,21 @@ export function apply(ctx, config = {}) {
 
   async function roleAgent(runtime, key, label, profile) {
     let pending = runtime.roleAgents.get(key)
+    const generation = 0
+    runtime.roleGenerations ??= new Map()
+    if (pending && runtime.roleGenerations.get(key) !== generation) {
+      const old = await pending
+      await old.agent.whenIdle()
+      arenaSessionContexts.delete(String(old.agent.id))
+      await old.dispose().catch(() => undefined)
+      runtime.agentHandles.delete(old)
+      runtime.roleAgents.delete(key)
+      pending = undefined
+    }
     if (!pending) {
       pending = createFullRoleAgent({ label, profile, runtime })
       runtime.roleAgents.set(key, pending)
+      runtime.roleGenerations.set(key, generation)
     }
     return pending
   }
@@ -1607,6 +1837,7 @@ export function apply(ctx, config = {}) {
       setRoleActivity(runtime.container, profile, {
         status: 'thinking', stage: uiMessage("runfullagentturn.empty.response.retrying.automatically"), detail: '', currentTool: '',
       }, uiMessage("runfullagentturn.detected.an.empty.response.retrying.once"))
+      recordRequest({ container: runtime.container, profile }, { retries: 1 })
       try {
         return await runFullAgentTurnOnce(handle, prompt, runtime, profile, phase)
       } catch (retryError) {
@@ -1636,7 +1867,7 @@ export function apply(ctx, config = {}) {
       '只响应人类明确要求。不得修改模型、密钥、权限或文件。reply 是要在群里公开显示的简洁确认。',
       '',
       '最近记录：',
-      transcriptText(isMeeting ? container.transcript : container.messages),
+       isMeeting ? meetingContextText(container, 'administrator') : transcriptText(container.messages),
     ].join('\n')
   }
 
@@ -1783,6 +2014,7 @@ export function apply(ctx, config = {}) {
     if (runtime.abort.signal.aborted) throw new Error('会议运行已停止')
     if (!runtime.pauseRequested) return true
     meeting.status = 'paused'
+    updateRun(meeting, 'paused', runtime.summaryRequested ? 'summary' : 'idle')
     meeting.updatedAt = nowIso()
     await persist()
     return false
@@ -1796,11 +2028,18 @@ export function apply(ctx, config = {}) {
     await persist()
     try {
       const handle = await roleAgent(runtime, participant.id, `arena:${meeting.id}:${participant.name}`, participant)
+      if (await maybeAutoCompressMeeting(meeting, participant, runtime, handle)) await persist()
       if (runtime.abort.signal.aborted || runtime.cancelCurrentWork || isMuted(meeting, participant.id)) return
       participant.status = 'working'
       meeting.updatedAt = nowIso()
       await persist()
-      const result = await runFullAgentTurn(handle, participantPrompt(meeting, participant, coordinationPrompt(runtime, participant.id)), runtime, participant, 'work')
+      const afterMessageId = runtime.roleContextDelivered?.get(participant.id) || null
+      const latestContextMessageId = [...meeting.transcript].reverse().find(item => item.kind !== 'system')?.id
+      const result = await runFullAgentTurn(handle, participantPrompt(meeting, participant, coordinationPrompt(runtime, participant.id), afterMessageId), runtime, participant, 'work')
+      if (latestContextMessageId) {
+        runtime.roleContextDelivered ??= new Map()
+        runtime.roleContextDelivered.set(participant.id, latestContextMessageId)
+      }
       if (runtime.abort.signal.aborted || runtime.cancelCurrentWork) return
       if (isMuted(meeting, participant.id)) return
       if (result.silent && !result.autonomousMessageIds.length) return
@@ -1837,6 +2076,7 @@ export function apply(ctx, config = {}) {
     const available = container.participants.filter(item => !isMuted(container, item.id))
     return Promise.all(available.map(async profile => {
       if (profile.autoReplyDisabled) return { profile, shouldSpeak: true, reason: '此角色已关闭独立判断，请管理员直接判断它是否适合接话。' }
+      recordRequest({ container, profile }, { intentChecks: 1 })
       let failed = false
       setRoleActivity(container, profile, { status: 'thinking', stage: uiMessage("collectreplyintents.checking.whether.to.reply"), detail: '', currentTool: '' })
       try {
@@ -1853,7 +2093,7 @@ export function apply(ctx, config = {}) {
             'shouldSpeak=false：你的观点已经说过；只能礼貌附和或重复；必须等待人类提供信息；话头已经收束；或准备说的内容偏离人类当前焦点。尤其不要为了热闹而继续。',
             '连续自己接自己的话只在补交真实工作进度或结果时合理。reason 只写一句内部判断依据，不要在这里生成真正的群聊回复。',
             ...(isMeeting ? ['', '协作控制台：', meetingWorkspaceText(container)] : []),
-            '', '完整群聊记录：', transcriptText(records),
+            '', '完整群聊记录：', isMeeting ? meetingContextText(container, profile.id) : transcriptText(records),
           ].join('\n'),
           persona: `你是 ${profile.name}。${profile.role || '保持自然，并只在有实质内容时继续发言。'}`,
           profile,
@@ -1891,7 +2131,7 @@ export function apply(ctx, config = {}) {
           '如果候选发言会明显偏离人类最近的焦点，onTopic=false、complete=true、approvedSpeakerIds=[]，停止本次自动接话并等待人类。相关子问题、必要的澄清和任务执行不算跑题。',
           '如果只是重复、附和、抢话或没有实际推进，也应 complete=true。否则 onTopic=true、complete=false，并且只批准最适合接下一句话的 1 位。这样该角色发言后，所有角色会基于这条新消息再次独立判断。',
           'approvedSpeakerIds 只能来自上面的候选角色。',
-          '', '完整群聊记录：', transcriptText(isMeeting ? container.transcript : container.messages),
+           '', '完整群聊记录：', isMeeting ? meetingContextText(container, 'administrator') : transcriptText(container.messages),
         ].join('\n'),
         persona: `你是 ${admin.name}。${admin.role || '负责让群聊保持聚焦、自然且不刷屏。'}`,
         profile: admin,
@@ -1947,7 +2187,7 @@ export function apply(ctx, config = {}) {
         `你是 ${admin.name}，请为仍将继续的协作会议生成一份阶段总结。话题：${meeting.topic}`,
         'summary 总结截至目前已经达成的共识、完成的工作和可直接使用的成果；rationale 写清关键依据、风险和取舍；openItems 列出仍需人类决定或后续处理的事项。不要宣告会议结束，不要评选获胜角色。',
         '', '协作控制台：', meetingWorkspaceText(meeting),
-        '', '完整公开记录：', transcriptText(meeting.transcript),
+        '', '完整公开记录：', meetingContextText(meeting, 'administrator'),
       ].join('\n'),
       persona: `你是中立的会议管理员 ${admin.name}。`,
       profile: admin,
@@ -1993,6 +2233,7 @@ export function apply(ctx, config = {}) {
     runtimes.set(meeting.id, runtime)
     ensureActivityMonitor(meeting)
     meeting.status = 'running'
+    updateRun(meeting, 'running', pending?.summaryRequested ? 'summary' : pending?.currentTaskId ? 'task' : pending?.triggerSource === 'human' ? 'responding' : 'working', pending?.currentTaskId ?? meeting.run?.currentTaskId ?? null)
     meeting.updatedAt = nowIso()
     await persist()
     try {
@@ -2022,6 +2263,9 @@ export function apply(ctx, config = {}) {
           continue
         }
         meeting.turnCount = Number(meeting.turnCount || 0) + 1
+        meeting.run.lastTargetIds = ids
+        meeting.run.updatedAt = nowIso()
+        await persist()
         const triggerSource = runtime.triggerSource
         runtime.triggerSource = 'auto'
         await Promise.all(ids.map(async id => {
@@ -2047,15 +2291,18 @@ export function apply(ctx, config = {}) {
       const restartRequest = !runtime.abort.signal.aborted && !runtime.pauseRequested && (
         runtime.targetIds.size || runtime.adminCommands.length || runtime.summaryRequested
       ) ? {
-          targetIds: [...runtime.targetIds], adminCommands: [...runtime.adminCommands],
+      targetIds: [...runtime.targetIds], adminCommands: [...runtime.adminCommands],
           summaryRequested: runtime.summaryRequested, triggerSource: runtime.triggerSource || 'human',
+          currentTaskId: meeting.run?.currentTaskId ?? null,
         } : null
       await Promise.allSettled([...runtime.activeRuns].map(run => run.dispose()))
       await Promise.allSettled([...runtime.agentHandles].map(handle => handle.dispose()))
+      for (const handle of runtime.agentHandles) arenaSessionContexts.delete(String(handle.agent.id))
       if (runtime.parent) await runtime.parent.dispose().catch(() => undefined)
       runtimes.delete(meeting.id)
       if (restartRequest) enqueueMeetingRun(meeting, restartRequest)
       else meeting.status = 'paused'
+      updateRun(meeting, restartRequest ? 'queued' : 'paused', restartRequest ? 'queued' : runtime.abort.signal.aborted ? 'interrupted' : 'idle')
       meeting.participants = meeting.participants.map(item => ({ ...item, status: 'idle' }))
       meeting.updatedAt = nowIso()
       await persist().catch(() => undefined)
@@ -2082,8 +2329,10 @@ export function apply(ctx, config = {}) {
       adminCommands,
       summaryRequested: previous?.summaryRequested === true || request.summaryRequested === true,
       triggerSource: request.triggerSource || previous?.triggerSource || 'human',
+      currentTaskId: request.currentTaskId ?? previous?.currentTaskId ?? meeting.run?.currentTaskId ?? null,
     })
     meeting.status = 'queued'
+    updateRun(meeting, 'queued', request.currentTaskId ? 'task' : 'queued', request.currentTaskId ?? meeting.run?.currentTaskId ?? null)
     meeting.error = null
     if (meeting.collaborationStage === 'completed') meeting.collaborationStage = 'waiting-human'
     if (!queue.includes(meeting.id)) queue.push(meeting.id)
@@ -2099,7 +2348,10 @@ export function apply(ctx, config = {}) {
       administratorProfile: administratorSnapshot(), humanProfile: { ...profiles.human }, status: 'queued', turnCount: 0,
       createdAt, updatedAt: createdAt, transcript: [], mutedParticipantIds: [], userVote: null, verdict: null, error: null,
       collaborationStage: 'discussion', tasks: [], decisions: [], artifacts: [], workdir,
+      contextSettings: { autoCompressEnabled: false, autoCompressThreshold: 80 }, contextSummary: '',
+      contextCompressionCount: 0, run: { id: randomUUID(), status: 'queued', phase: 'queued', currentTaskId: null, lastTargetIds: [], attempt: 0, startedAt: null, updatedAt: createdAt },
       permissions: Object.fromEntries([['administrator', 'danger-full-access'], ...input.participants.map(item => [item.id, 'danger-full-access'])]),
+      capabilities: Object.fromEntries([['administrator', normalizeCapabilities()], ...input.participants.map(item => [item.id, normalizeCapabilities(item.capabilities)])]),
     }
     ensureActivityMonitor(meeting)
     meetings.set(meeting.id, meeting)
@@ -2120,6 +2372,8 @@ export function apply(ctx, config = {}) {
     meeting.participants.push(...invited.map(item => ({ ...item, status: 'idle' })))
     meeting.permissions ??= {}
     for (const item of invited) meeting.permissions[item.id] = 'danger-full-access'
+    meeting.capabilities ??= {}
+    for (const item of invited) meeting.capabilities[item.id] = normalizeCapabilities(item.capabilities)
     ensureActivityMonitor(meeting)
     appendSystem(meeting, uiMessage("addmeetingmembers.value.joined.the.meeting", { p0: invited.map(item => item.name).join('、') }), true)
     return meeting
@@ -2143,6 +2397,18 @@ export function apply(ctx, config = {}) {
     return container
   }
 
+  async function setContainerCapability(container, raw) {
+    const profileId = String(raw?.profileId || '')
+    const target = permissionProfiles(container).find(item => item.id === profileId)
+    const capability = String(raw?.capability || '')
+    if (!target || !ARENA_CAPABILITY_KEYS.includes(capability)) throw new HttpError(400, uiMessage("actonmeeting.invalid.capability"))
+    container.capabilities ??= {}
+    container.capabilities[profileId] = { ...capabilityFor(container, profileId), [capability]: raw.enabled === true }
+    container.updatedAt = nowIso()
+    await persist()
+    return container
+  }
+
   async function actOnMeeting(meeting, body) {
     const action = String(body?.action ?? '')
     const runtime = runtimes.get(meeting.id)
@@ -2151,14 +2417,24 @@ export function apply(ctx, config = {}) {
       if (!runtime || meeting.status !== 'running') throw new HttpError(409, uiMessage("actonmeeting.no.ai.reply.is.currently.in.progress"))
       runtime.pauseRequested = true
       meeting.status = 'pausing'
-    } else if (action === 'resume' || action === 'reopen') {
-      const targets = meeting.participants.filter(item => !isMuted(meeting, item.id)).map(item => item.id)
+      updateRun(meeting, 'pausing', meeting.run?.phase ?? 'working')
+    } else if (action === 'resume' || action === 'reopen' || action === 'retry') {
+      ensureMeetingWorkspace(meeting)
+      const task = meeting.tasks?.find(item => item.id === meeting.run?.currentTaskId && item.status === 'in-progress')
+      const available = meeting.participants.filter(item => !isMuted(meeting, item.id)).map(item => item.id)
+      const targets = task?.assigneeId && task.assigneeId !== 'administrator' && !isMuted(meeting, task.assigneeId)
+        ? [task.assigneeId]
+        : action === 'retry' || (meeting.run.phase === 'interrupted' && meeting.run.lastTargetIds.length)
+          ? meeting.run.lastTargetIds.filter(id => available.includes(id))
+          : available
+      if (!targets.length) throw new HttpError(409, uiMessage("actonmeeting.no.roles.available.to.retry"))
+      if (action === 'retry') meeting.run.attempt += 1
       if (runtime) {
         runtime.triggerSource = 'human'
         targets.forEach(id => runtime.targetIds.add(id))
         wakeRuntime(meeting, runtime)
       } else {
-        enqueueMeetingRun(meeting, { targetIds: targets, triggerSource: 'human' })
+        enqueueMeetingRun(meeting, { targetIds: targets, currentTaskId: task?.id ?? null, triggerSource: 'human' })
         shouldPump = true
       }
     } else if (action === 'finish' || action === 'summarize') {
@@ -2175,6 +2451,7 @@ export function apply(ctx, config = {}) {
         pendingMeetingStarts.delete(meeting.id)
         for (let index = queue.length - 1; index >= 0; index -= 1) if (queue[index] === meeting.id) queue.splice(index, 1)
         meeting.status = 'paused'
+        updateRun(meeting, 'paused', 'idle')
       } else if (runtime) {
         runtime.cancelCurrentWork = true
         runtime.pauseRequested = true
@@ -2182,6 +2459,7 @@ export function apply(ctx, config = {}) {
         runtime.targetIds.clear()
         runtime.adminCommands.length = 0
         meeting.status = 'pausing'
+        updateRun(meeting, 'pausing', meeting.run?.phase ?? 'working')
         for (const run of runtime.activeRuns) void run.dispose().catch(() => undefined)
         for (const pending of runtime.roleAgents.values()) {
           void pending.then(handle => handle.agent.cancel({ kind: 'user' }, { keepInbox: false })).catch(() => undefined)
@@ -2228,6 +2506,18 @@ export function apply(ctx, config = {}) {
       addMeetingMembers(meeting, body)
     } else if (action === 'set-permission') {
       await setContainerPermission(meeting, body)
+    } else if (action === 'set-capability') {
+      await setContainerCapability(meeting, body)
+    } else if (action === 'compress-context') {
+      ensureMeetingWorkspace(meeting)
+      const profileId = String(body.profileId || 'administrator')
+      await compactRoleSession(meeting, profileId, new AbortController().signal)
+    } else if (action === 'set-context-settings') {
+      ensureMeetingWorkspace(meeting)
+      meeting.contextSettings = {
+        autoCompressEnabled: body.autoCompressEnabled === true,
+        autoCompressThreshold: Math.max(50, Math.min(95, Math.round(Number(body.autoCompressThreshold) || 80))),
+      }
     } else if (action === 'set-stage') {
       const stage = String(body.stage ?? '')
       if (!MEETING_STAGES.includes(stage) || stage === 'completed') throw new HttpError(400, uiMessage("actonmeeting.invalid.collaboration.stage"))
@@ -2237,7 +2527,23 @@ export function apply(ctx, config = {}) {
     } else if (action === 'task-create') {
       createWorkspaceTask(meeting, body, 'human')
     } else if (action === 'task-update') {
-      updateWorkspaceTask(meeting, body)
+      const task = updateWorkspaceTask(meeting, body)
+      if (task.status === 'in-progress' && String(body.status) === 'in-progress') {
+        const assigneeId = task.assigneeId
+        if (assigneeId && assigneeId !== 'administrator' && !isMuted(meeting, assigneeId)) {
+          updateRun(meeting, runtime ? 'running' : 'queued', 'task', task.id)
+          if (runtime) {
+            runtime.targetIds.add(assigneeId)
+            runtime.triggerSource = 'human'
+            wakeRuntime(meeting, runtime)
+          } else {
+            enqueueMeetingRun(meeting, { targetIds: [assigneeId], currentTaskId: task.id, triggerSource: 'human' })
+            shouldPump = true
+          }
+        }
+      } else if (meeting.run?.currentTaskId === task.id && ['done', 'paused', 'blocked', 'review'].includes(task.status)) {
+        updateRun(meeting, meeting.status, 'idle', null)
+      }
     } else if (action === 'task-delete') {
       deleteWorkspaceTask(meeting, body)
     } else if (action === 'decision-create') {
@@ -2414,6 +2720,7 @@ export function apply(ctx, config = {}) {
       await persist().catch(() => undefined)
       await Promise.allSettled([...runtime.activeRuns].map(run => run.dispose()))
       await Promise.allSettled([...runtime.agentHandles].map(handle => handle.dispose()))
+      for (const handle of runtime.agentHandles) arenaSessionContexts.delete(String(handle.agent.id))
       if (runtime.parent) await runtime.parent.dispose().catch(() => undefined)
       runtime.running = false
       if (runtime.targetIds.size || runtime.adminCommands.length) {
@@ -2468,7 +2775,7 @@ export function apply(ctx, config = {}) {
       name: nameInput || (type === 'direct' ? participants[0].name : `${participants.map(item => item.name).join('、')}的小群`),
       participants: participants.map(item => ({ ...item })), humanProfile: { ...profiles.human },
       administratorProfile: type === 'group' ? administratorSnapshot() : null,
-      messages: [], workdir, mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
+      messages: [], workdir, mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), capabilities: Object.fromEntries([...(type === 'group' ? [['administrator', normalizeCapabilities()]] : []), ...participants.map(item => [item.id, normalizeCapabilities(item.capabilities)])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
     }
     ensureActivityMonitor(room)
     rooms.set(room.id, room)
@@ -2522,6 +2829,8 @@ export function apply(ctx, config = {}) {
     room.participants.push(...invited.map(item => ({ ...item })))
     room.permissions ??= {}
     for (const item of invited) room.permissions[item.id] = 'danger-full-access'
+    room.capabilities ??= {}
+    for (const item of invited) room.capabilities[item.id] = normalizeCapabilities(item.capabilities)
     ensureActivityMonitor(room)
     appendSystem(room, uiMessage("addroommembers.value.joined.the.group", { p0: invited.map(item => item.name).join('、') }), false)
     room.updatedAt = nowIso()
@@ -2605,6 +2914,7 @@ export function apply(ctx, config = {}) {
           if (method === 'POST' && suffix.endsWith('/actions')) {
             const body = await readJsonBody(req)
             if (String(body?.action || '') === 'set-permission') await setContainerPermission(room, body)
+            else if (String(body?.action || '') === 'set-capability') await setContainerCapability(room, body)
             else if (String(body?.action || '') === 'approval') await resolveArenaApproval(room, body)
             else throw new HttpError(400, uiMessage("apply.unknown.chat.action"))
             respond(res, 200, { room: publicMeeting(room) }); return
@@ -2615,9 +2925,20 @@ export function apply(ctx, config = {}) {
             rooms.delete(room.id); await persist(); respond(res, 200, { ok: true }); return
           }
         }
-        const match = /^\/meetings\/([^/]+)(?:\/actions)?$/.exec(suffix)
+        const match = /^\/meetings\/([^/]+)(?:\/(actions|context))?$/.exec(suffix)
         if (match) {
           const meeting = meetingOrThrow(decodeURIComponent(match[1]))
+          if (method === 'GET' && suffix.endsWith('/context')) {
+            const administratorEstimate = estimateMeetingContext(meeting, contextWindowFor(meeting.administratorProfile), 'administrator')
+            respond(res, 200, { context: publicMeeting({
+              ...administratorEstimate,
+              summary: getMeetingContextState(meeting, 'administrator').summary,
+              summaryUpdatedAt: getMeetingContextState(meeting, 'administrator').summaryUpdatedAt,
+              compressionCount: getMeetingContextState(meeting, 'administrator').compressionCount,
+              roles: contextSnapshotFor(meeting),
+              settings: meeting.contextSettings,
+            }) }); return
+          }
           if (method === 'GET' && !suffix.endsWith('/actions')) { respond(res, 200, { meeting: publicMeeting(meeting) }); return }
           if (method === 'PATCH' && !suffix.endsWith('/actions')) { respond(res, 200, { meeting: publicMeeting(await renameMeeting(meeting, await readJsonBody(req))) }); return }
           if (method === 'DELETE' && !suffix.endsWith('/actions')) { await deleteMeeting(meeting); respond(res, 200, { ok: true }); return }

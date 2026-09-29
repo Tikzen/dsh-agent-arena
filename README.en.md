@@ -10,6 +10,32 @@ Bring several AI users and a human user into one persistent collaboration space.
 
 <p align="center"><sub>Select AI users that are already configured in DSH to create a persistent collaboration meeting instead of repeatedly entering a provider and model.</sub></p>
 
+## v0.6.0 update overview
+
+This release is developed and checked against **DeepSeek Harness Web 0.1.7-rc.2**. The standard package only guarantees compatibility with DSH Web `0.1.7-rc.2`; other DSH versions are not guaranteed for now. Dedicated compatibility releases for other versions will be developed later.
+
+### Per-role context usage and compression
+
+- The Activity panel now shows estimated tokens, model context window, usage percentage, uncompressed messages, and a detailed breakdown for each role.
+- Every AI role keeps its own compression cursor, summary, and compression count. Public chat history remains visible to all roles.
+- Creating an AI user requires choosing either **DSH native compression** or **server-side compression**.
+- DSH native compression supports per-role “Compress now” and meeting-level auto-compression with an adjustable threshold. The visible chat transcript is never deleted.
+- With server-side compression selected, the manual compression button is disabled with an explanation. Actual support depends on the provider, such as the OpenAI Responses API.
+
+### Role capabilities, run status, and action audit
+
+- Each meeting or group chat can independently control Files, Terminal, Network, Subagents, Collaboration, and Skills / MCP for every AI role.
+- The Activity panel shows run status, phase, request count, Tokens, reply checks, errors, retries, and the latest duration. Tokens are placed on a separate second line so long values do not squeeze the other metrics.
+- Role action records are retained in a history window instead of being replaced by the newest state.
+- Meetings support pause, resume, and retry; not-started tasks have an explicit “Start task” button.
+
+### Collaboration UI and bilingual coverage
+
+- The mode navigation can collapse. Activity, Tasks, Decisions, and Deliverables sections can be resized, and long meeting titles no longer push the right panel or human composer off-screen.
+- The decision board presents per-option opinion summaries and details for comparing reasons, risks, and confidence; the human still chooses the final solution and no popularity vote is used.
+- Selected participant cards show only the role name, provider/model, and enabled capabilities instead of the full persona text. The persona remains stored and is still used in actual conversations.
+- All new context, capability, runtime-statistics, approval, and error copy is available in Chinese and English and follows DSH's native locale service.
+
 ## v0.5.0 update overview
 
 This release gives each collaboration space its own project directory, fixes overlaps under translucent themes, and lets Agent Arena follow DSH's Chinese/English language setting.
@@ -207,7 +233,8 @@ The right collaboration console can expand each role's activity separately to sh
 
 - Node.js 22 or newer
 - DeepSeek Harness Web profile
-- v0.5.0 language switching relies on DSH's native locale service; use the dedicated compatibility release below for Web `0.1.5-rc.2`
+- The standard release is developed and checked against DSH Web `0.1.7-rc.2`; other DSH versions are not guaranteed. Dedicated compatibility releases will follow later.
+- Language switching relies on DSH's native locale service
 - At least one model provider configured in DSH Settings
 
 ## Installation
@@ -235,23 +262,8 @@ Restart DSH. The home page will show “Enter AI collaboration”, and existing 
 The repository includes prebuilt `lib/` files, so a local TypeScript toolchain is not required. Pin to the stable release:
 
 ```powershell
-<DSH installation directory>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.5.0"
+<DSH installation directory>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.6.0"
 ```
-
-### DSH Web version mapping
-
-| DSH Web version | Agent Arena release | Notes |
-| --- | --- | --- |
-| `0.1.7-rc.2` | `v0.5.0` | Use the standard release. |
-| `0.1.5-rc.2` | `v0.5.0-dsh015.1` | Use the dedicated compatibility release because the old empty-session home page does not render the session input slot. |
-
-For DSH Web `0.1.5-rc.2`, replace the tag in the command with `v0.5.0-dsh015.1`:
-
-```powershell
-<DSH installation directory>\manage-dsh.bat plugin --profile web add "github:Tikzen/dsh-agent-arena#v0.5.0-dsh015.1"
-```
-
-Here, `0.1.5` and `0.1.7` refer to the published `rc.2` builds, not a final desktop release.
 
 To follow the latest development version from `main`:
 

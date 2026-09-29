@@ -94,3 +94,12 @@ test('narrow meetings keep translated controls reachable without overlapping cha
   assert.match(declarations('.arena-collab-layout .arena-stage'), /overflow:\s*auto/)
   assert.match(declarations('.arena-controls'), /flex:\s*none/)
 })
+
+test('Arena typography has no sub-12px explicit text and mode subtitles remain available', () => {
+  const css = arenaCss()
+  const sizes = [...css.matchAll(/font-size:\s*(\d+)px/g)].map(match => Number(match[1]))
+  assert.ok(sizes.length > 100)
+  assert.ok(sizes.every(size => size >= 12), 'small UI text must be at least 12px')
+  assert.match(css, /\.arena-mode-nav\s*\{[^}]*grid-template-columns:\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)/)
+  assert.match(css, /\.arena-mode-nav button small\s*\{\s*display:\s*block;/)
+})

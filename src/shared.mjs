@@ -3,6 +3,17 @@ export const API_ROOT = '/api/plugins/dsh-agent-arena'
 
 export const MEETING_STAGES = ['discussion', 'planning', 'execution', 'review', 'waiting-human', 'completed']
 export const TASK_STATUSES = ['todo', 'in-progress', 'review', 'done', 'blocked', 'paused']
+export const ARENA_CAPABILITY_KEYS = ['files', 'terminal', 'network', 'subagents', 'collaboration', 'skillsMcp']
+export const COMPRESSION_MODES = ['dsh', 'server']
+
+export function normalizeCompressionMode(value) {
+  return COMPRESSION_MODES.includes(value) ? value : 'dsh'
+}
+
+export function normalizeCapabilities(value) {
+  const source = value && typeof value === 'object' ? value : {}
+  return Object.fromEntries(ARENA_CAPABILITY_KEYS.map(key => [key, source[key] !== false]))
+}
 
 /** Add the collaborative-workspace fields introduced after the first release.
  * Mutating in place keeps old persisted meetings compatible without rewriting
@@ -14,7 +25,137 @@ export function ensureMeetingWorkspace(meeting) {
   if (!Array.isArray(meeting.tasks)) meeting.tasks = []
   if (!Array.isArray(meeting.decisions)) meeting.decisions = []
   if (!Array.isArray(meeting.artifacts)) meeting.artifacts = []
+  if (!meeting.contextSettings || typeof meeting.contextSettings !== 'object') meeting.contextSettings = {}
+  meeting.contextSettings.autoCompressEnabled = meeting.contextSettings.autoCompressEnabled === true
+  const threshold = Number(meeting.contextSettings.autoCompressThreshold)
+  meeting.contextSettings.autoCompressThreshold = Number.isFinite(threshold)
+    ? Math.max(50, Math.min(95, Math.round(threshold)))
+    : 80
+  if (typeof meeting.contextSummary !== 'string') meeting.contextSummary = ''
+  if (!meeting.contextByProfile || typeof meeting.contextByProfile !== 'object' || Array.isArray(meeting.contextByProfile)) meeting.contextByProfile = {}
+  for (const [profileId, raw] of Object.entries(meeting.contextByProfile)) {
+    const source = raw && typeof raw === 'object' ? raw : {}
+    meeting.contextByProfile[profileId] = {
+      summary: typeof source.summary === 'string' ? source.summary.slice(-6000) : '',
+      compressedThroughId: typeof source.compressedThroughId === 'string' ? source.compressedThroughId : null,
+      compressionCount: Number.isFinite(Number(source.compressionCount)) ? Math.max(0, Math.floor(Number(source.compressionCount))) : 0,
+      summaryUpdatedAt: typeof source.summaryUpdatedAt === 'string' ? source.summaryUpdatedAt : null,
+    }
+  }
+  meeting.contextCompressionCount = Number.isFinite(Number(meeting.contextCompressionCount))
+    ? Math.max(0, Math.floor(Number(meeting.contextCompressionCount)))
+    : 0
+  if (!meeting.run || typeof meeting.run !== 'object') meeting.run = {}
+  meeting.run = {
+    id: typeof meeting.run.id === 'string' && meeting.run.id ? meeting.run.id : null,
+    status: typeof meeting.run.status === 'string' ? meeting.run.status : 'idle',
+    phase: typeof meeting.run.phase === 'string' ? meeting.run.phase : 'idle',
+    currentTaskId: typeof meeting.run.currentTaskId === 'string' ? meeting.run.currentTaskId : null,
+    lastTargetIds: Array.isArray(meeting.run.lastTargetIds) ? meeting.run.lastTargetIds.map(String).slice(0, 12) : [],
+    attempt: Math.max(0, Number(meeting.run.attempt) || 0),
+    startedAt: meeting.run.startedAt || null,
+    updatedAt: meeting.run.updatedAt || meeting.updatedAt || null,
+  }
   return meeting
+}
+
+function contextState(meeting, profileId) {
+  ensureMeetingWorkspace(meeting)
+  const key = String(profileId || '').trim()
+  if (!key) return {
+    summary: meeting.contextSummary,
+    compressedThroughId: meeting.contextCompressedThroughId,
+    compressionCount: meeting.contextCompressionCount,
+    summaryUpdatedAt: meeting.contextSummaryUpdatedAt || null,
+  }
+  if (!meeting.contextByProfile[key]) {
+    meeting.contextByProfile[key] = {
+      summary: meeting.contextSummary,
+      compressedThroughId: meeting.contextCompressedThroughId || null,
+      compressionCount: meeting.contextCompressionCount,
+      summaryUpdatedAt: meeting.contextSummaryUpdatedAt || null,
+    }
+  }
+  return meeting.contextByProfile[key]
+}
+
+export function getMeetingContextState(meeting, profileId) {
+  const state = contextState(meeting, profileId)
+  return { ...state }
+}
+
+export function estimateMeetingContext(meeting, contextWindow = null, profileId = null) {
+  ensureMeetingWorkspace(meeting)
+  const visible = (meeting.transcript ?? []).filter(item => item.kind !== 'system')
+  const state = contextState(meeting, profileId)
+  const checkpoint = state.compressedThroughId
+  const checkpointIndex = checkpoint ? visible.findIndex(item => item.id === checkpoint) : -1
+  const recent = checkpointIndex >= 0 ? visible.slice(checkpointIndex + 1) : visible
+  const conversationText = recent.map(item => `${item.speaker ?? item.senderName ?? ''}: ${item.text ?? ''}`).join('\n\n')
+  const selectedProfile = profileId
+    ? (profileId === 'administrator' ? meeting.administratorProfile : (meeting.participants ?? []).find(item => item.id === profileId))
+    : null
+  const characters = {
+    topic: String(meeting.topic ?? '').length,
+    personas: selectedProfile
+      ? String(selectedProfile.role ?? '').length
+      : (meeting.participants ?? []).reduce((sum, item) => sum + String(item.role ?? '').length, 0),
+    summary: state.summary.length,
+    conversation: Math.min(conversationText.length, 24_000),
+    workspace: JSON.stringify({ tasks: meeting.tasks, decisions: meeting.decisions, artifacts: meeting.artifacts }).length,
+  }
+  const breakdown = Object.fromEntries(Object.entries(characters).map(([key, value]) => [key, Math.ceil(value / 3)]))
+  const promptEstimate = Object.values(breakdown).reduce((sum, value) => sum + value, 0)
+  const activityRoles = profileId
+    ? (meeting.activityMonitor?.roles ?? []).filter(item => item.profileId === profileId)
+    : (meeting.activityMonitor?.roles ?? [])
+  const lastInputTokens = Math.max(0, ...activityRoles.map(item => Number(item.stats?.lastInputTokens) || 0))
+  if (lastInputTokens > promptEstimate) breakdown.session = lastInputTokens - promptEstimate
+  const estimatedTokens = Math.max(promptEstimate, lastInputTokens)
+  return {
+    estimatedTokens, breakdown, contextWindow: Number(contextWindow) > 0 ? Number(contextWindow) : null,
+    percent: Number(contextWindow) > 0 ? Math.round(estimatedTokens / Number(contextWindow) * 100) : null,
+    totalMessages: visible.length, uncompressedMessages: recent.length,
+  }
+}
+
+export function compactMeetingContext(meeting, keepRecent = 12) {
+  return compactMeetingContextFor(meeting, keepRecent, null)
+}
+
+export function compactMeetingContextFor(meeting, keepRecent = 12, profileId = null) {
+  ensureMeetingWorkspace(meeting)
+  const visible = (meeting.transcript ?? []).filter(item => item.kind !== 'system')
+  const state = contextState(meeting, profileId)
+  const checkpointIndex = state.compressedThroughId
+    ? visible.findIndex(item => item.id === state.compressedThroughId)
+    : -1
+  const newEnd = visible.length - Math.max(1, keepRecent)
+  if (newEnd <= checkpointIndex + 1) return false
+  const earlier = visible.slice(checkpointIndex + 1, newEnd)
+  // Keep a compact, attributed record, including the previous summary. The
+  // visible transcript is never altered; only subsequent prompts use this.
+  const lines = earlier.map(item => {
+    const text = String(item.text ?? '').replace(/\s+/g, ' ').trim()
+    return `${item.speaker ?? item.senderName ?? '成员'}：${text.slice(0, 260)}${text.length > 260 ? '…' : ''}`
+  })
+  const merged = [state.summary, ...lines].filter(Boolean).join('\n')
+  state.summary = merged.slice(-6000)
+  state.compressedThroughId = visible[newEnd - 1].id
+  state.summaryUpdatedAt = new Date().toISOString()
+  state.compressionCount += 1
+  if (!profileId) {
+    meeting.contextSummary = state.summary
+    meeting.contextCompressedThroughId = state.compressedThroughId
+    meeting.contextSummaryUpdatedAt = state.summaryUpdatedAt
+    meeting.contextCompressionCount += 1
+  } else {
+    meeting.contextCompressionCount += 1
+  }
+  for (const role of meeting.activityMonitor?.roles ?? []) {
+    if (role.stats && (!profileId || role.profileId === profileId)) role.stats.lastInputTokens = 0
+  }
+  return true
 }
 
 export const ARENA_TEMPLATES = [
@@ -115,6 +256,8 @@ export function validateMeetingInput(raw) {
       color,
       ...(provider ? { provider } : {}),
       ...(model ? { model } : {}),
+      compressionMode: normalizeCompressionMode(source?.compressionMode),
+      capabilities: normalizeCapabilities(source?.capabilities),
     }
   })
 

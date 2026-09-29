@@ -3,11 +3,16 @@ import assert from 'node:assert/strict'
 import {
   ARENA_TEMPLATES,
   autonomousMessageFingerprint,
+  compactMeetingContext,
+  compactMeetingContextFor,
   ensureMeetingWorkspace,
+  estimateMeetingContext,
+  getMeetingContextState,
   isDuplicateAutonomousMessage,
   isArenaSessionPrompt,
   mentionedProfileIds,
   mentionsAdministrator,
+  normalizeCapabilities,
   parseSpeechDirectives,
   renderPersonaTemplate,
   shouldRequirePeerReaction,
@@ -29,9 +34,64 @@ test('hydrates the collaborative workspace on legacy meetings', () => {
   assert.deepEqual(legacy.tasks, [])
   assert.deepEqual(legacy.decisions, [])
   assert.deepEqual(legacy.artifacts, [])
+  assert.equal(legacy.contextSettings.autoCompressEnabled, false)
+  assert.equal(legacy.run.status, 'idle')
 
   const completed = ensureMeetingWorkspace({ status: 'completed' })
   assert.equal(completed.collaborationStage, 'completed')
+})
+
+test('context compression preserves visible transcript and includes only new messages in future context', () => {
+  const meeting = ensureMeetingWorkspace({
+    topic: 'Project',
+    participants: [{ id: 'a', role: 'Engineer' }],
+    transcript: Array.from({ length: 18 }, (_, index) => ({
+      id: `m${index}`, kind: 'participant', speaker: 'Engineer', text: `Result ${index}`,
+    })),
+    activityMonitor: { roles: [{ stats: { lastInputTokens: 4000 } }] },
+  })
+  const before = JSON.stringify(meeting.transcript)
+  assert.equal(estimateMeetingContext(meeting, 8000).estimatedTokens, 4000)
+  assert.equal(compactMeetingContext(meeting), true)
+  assert.equal(JSON.stringify(meeting.transcript), before)
+  assert.equal(meeting.contextCompressedThroughId, 'm5')
+  assert.match(meeting.contextSummary, /Result 0/)
+  assert.equal(meeting.activityMonitor.roles[0].stats.lastInputTokens, 0)
+  assert.equal(estimateMeetingContext(meeting, 1000).uncompressedMessages, 12)
+  assert.equal(compactMeetingContext(meeting), false)
+  meeting.transcript.push({ id: 'm18', kind: 'user', speaker: 'Human', text: 'New request' })
+  assert.equal(estimateMeetingContext(meeting).uncompressedMessages, 13)
+})
+
+test('role context compression stays independent', () => {
+  const meeting = ensureMeetingWorkspace({
+    topic: 'Independent windows',
+    participants: [
+      { id: 'a', role: 'Engineer' },
+      { id: 'b', role: 'Reviewer' },
+    ],
+    administratorProfile: { id: 'administrator', role: 'Coordinator' },
+    transcript: Array.from({ length: 18 }, (_, index) => ({
+      id: `r${index}`, kind: 'participant', speaker: 'Member', text: `Message ${index}`,
+    })),
+    activityMonitor: { roles: [
+      { profileId: 'a', stats: { lastInputTokens: 1800 } },
+      { profileId: 'b', stats: { lastInputTokens: 4200 } },
+    ] },
+  })
+  assert.equal(compactMeetingContextFor(meeting, 12, 'a'), true)
+  assert.equal(getMeetingContextState(meeting, 'a').compressedThroughId, 'r5')
+  assert.equal(getMeetingContextState(meeting, 'b').compressedThroughId, null)
+  assert.equal(estimateMeetingContext(meeting, 8000, 'a').uncompressedMessages, 12)
+  assert.equal(estimateMeetingContext(meeting, 8000, 'b').uncompressedMessages, 18)
+  assert.equal(meeting.activityMonitor.roles[0].stats.lastInputTokens, 0)
+  assert.equal(meeting.activityMonitor.roles[1].stats.lastInputTokens, 4200)
+})
+
+test('capability defaults stay open and explicit restrictions are normalized', () => {
+  assert.equal(normalizeCapabilities().skillsMcp, true)
+  assert.equal(normalizeCapabilities({ network: false, terminal: 0 }).network, false)
+  assert.equal(normalizeCapabilities({ network: false, terminal: 0 }).terminal, true)
 })
 
 test('ships four useful meeting templates', () => {

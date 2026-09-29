@@ -56,7 +56,7 @@ test('relative and absolute file claims resolve to the same room target', async 
   if (process.platform === 'win32') assert.equal(relative.key, normalizeCoordinationFile(relative.path.toUpperCase(), blue).key)
 })
 
-async function harness(t) {
+async function harness(t, services = {}) {
   const dirs = await fixture(t)
   const a = { id: 'a', name: 'Alpha', provider: 'test', model: 'test', avatar: 'A' }
   const b = { id: 'b', name: 'Beta', provider: 'test', model: 'test', avatar: 'B' }
@@ -77,13 +77,13 @@ async function harness(t) {
   const created = []
   const cleanups = []
   const ctx = {
-    get() { return undefined },
+    get(name) { return services[name] },
     on() { return () => {} },
     effect(fn) { const cleanup = fn(); if (typeof cleanup === 'function') cleanups.push(cleanup) },
     agentDefaultModel: { currentSelection: () => ({ provider: 'test', model: 'test' }) },
     workspaceRegistry: { archiveSession: async () => {}, archivedSessionIds: [] },
     sessionPersistence: { list: async () => [] },
-    llm: { listProviders: () => [], listModels: async () => [] },
+    llm: { listProviders: () => [{ id: 'test', name: 'Test' }], listModels: async () => [{ id: 'test', name: 'Test' }] },
     webServer: { register(route) { handler = route.handler; return () => {} } },
     subagents: { start() { throw new Error('Unexpected model/subagent call in test') } },
     agents: {
@@ -95,6 +95,7 @@ async function harness(t) {
         const handle = {
           agent: {
             id: options.sessionId, session,
+            ctx: { get(name) { return name === 'compaction' ? services.roleCompaction : undefined } },
             followup() {
               const gate = hold
               hold = undefined
@@ -205,6 +206,87 @@ test('meeting parent and role agents receive the configured cwd', async t => {
   assert.equal((await h.request('POST', '/meetings/m1/actions', { action: 'intervene', text: '@Alpha test' })).status, 200)
   await eventually(async () => h.created.length >= 2 && (await h.request('GET', '/meetings/m1')).data.meeting.status === 'paused')
   assert.ok(h.created.every(item => item.options.meta.cwd === h.red))
+})
+
+test('meeting context settings, compression, and per-conversation capabilities persist', async t => {
+  const h = await harness(t)
+  const context = await h.request('GET', '/meetings/m1/context')
+  assert.equal(context.status, 200)
+  assert.equal(context.data.context.contextWindow, null)
+  assert.equal(context.data.context.settings.autoCompressEnabled, false)
+  const settings = await h.request('POST', '/meetings/m1/actions', {
+    action: 'set-context-settings', autoCompressEnabled: true, autoCompressThreshold: 85,
+  })
+  assert.equal(settings.data.meeting.contextSettings.autoCompressThreshold, 85)
+  const restricted = await h.request('POST', '/meetings/m1/actions', {
+    action: 'set-capability', profileId: 'a', capability: 'terminal', enabled: false,
+  })
+  assert.equal(restricted.data.meeting.capabilities.a.terminal, false)
+  assert.equal(restricted.data.meeting.capabilities.b.terminal, true)
+  assert.equal((await h.request('POST', '/meetings/m1/actions', { action: 'compress-context' })).status, 409)
+  const stored = JSON.parse(await readFile(join(h.stateDir, 'meetings.json'), 'utf8')).meetings[0]
+  assert.equal(stored.capabilities.a.terminal, false)
+  assert.equal(stored.contextSettings.autoCompressEnabled, true)
+  assert.equal((await h.request('POST', '/rooms/r1/actions', { action: 'set-capability', profileId: 'b', capability: 'network', enabled: false })).data.room.capabilities.b.network, false)
+})
+
+test('AI compaction method is required, persisted and copied into existing meetings', async t => {
+  const h = await harness(t)
+  const base = { name: 'Gamma', avatar: 'G', provider: 'test', model: 'test' }
+  assert.equal((await h.request('POST', '/profiles/ai', base)).status, 400)
+  const created = await h.request('POST', '/profiles/ai', { ...base, compressionMode: 'server' })
+  assert.equal(created.status, 200)
+  assert.equal(created.data.profile.compressionMode, 'server')
+  const changed = await h.request('POST', '/profiles/ai', { ...base, id: 'a', compressionMode: 'server' })
+  assert.equal(changed.status, 200)
+  assert.equal((await h.request('GET', '/meetings/m1/context')).data.context.roles.find(role => role.profileId === 'a').compressionMode, 'server')
+  assert.equal((await h.request('POST', '/meetings/m1/actions', { action: 'compress-context', profileId: 'a' })).status, 409)
+  const stored = JSON.parse(await readFile(join(h.stateDir, 'meetings.json'), 'utf8'))
+  assert.equal(stored.profiles.aiUsers.find(role => role.id === 'a').compressionMode, 'server')
+  assert.equal(stored.meetings[0].participants.find(role => role.id === 'a').compressionMode, 'server')
+  assert.equal(stored.meetings[0].participants.find(role => role.id === 'b').compressionMode, 'dsh')
+})
+
+test('manual DSH compaction uses the selected role preset service', async t => {
+  const compacted = []
+  const h = await harness(t, { roleCompaction: {
+    async compactNow(agent) {
+      compacted.push(agent.id)
+      return { summary: [{ type: 'text', text: 'A useful checkpoint' }] }
+    },
+  } })
+  const release = h.holdNextTurn()
+  t.after(release)
+  assert.equal((await h.request('POST', '/meetings/m1/actions', { action: 'intervene', text: '@Alpha investigate' })).status, 200)
+  await eventually(() => h.created.some(item => item.tools.has('arena_coordination')))
+  const role = h.created.find(item => item.tools.has('arena_coordination'))
+  const compressed = await h.request('POST', '/meetings/m1/actions', { action: 'compress-context', profileId: 'a' })
+  assert.equal(compressed.status, 200)
+  assert.deepEqual(compacted, [role.handle.agent.id])
+  const context = await h.request('GET', '/meetings/m1/context')
+  assert.equal(context.data.context.roles.find(item => item.profileId === 'a').summary, 'A useful checkpoint')
+  assert.equal(context.data.context.roles.find(item => item.profileId === 'b').summary, '')
+  release()
+  await eventually(async () => (await h.request('GET', '/meetings/m1')).data.meeting.status === 'paused')
+})
+
+test('starting an assigned task dispatches only that role and retains a resumable run', async t => {
+  const h = await harness(t)
+  const release = h.holdNextTurn()
+  t.after(release)
+  const created = await h.request('POST', '/meetings/m1/actions', { action: 'task-create', title: 'Investigate', assigneeId: 'a' })
+  const taskId = created.data.meeting.tasks[0].id
+  await h.request('POST', '/meetings/m1/actions', { action: 'set-capability', profileId: 'a', capability: 'terminal', enabled: false })
+  const started = await h.request('POST', '/meetings/m1/actions', { action: 'task-update', taskId, status: 'in-progress' })
+  assert.equal(started.status, 200)
+  assert.equal(started.data.meeting.run.currentTaskId, taskId)
+  await eventually(() => h.created.some(item => item.tools.has('arena_coordination')))
+  const role = h.created.find(item => item.tools.has('arena_coordination'))
+  assert.match(role.guards[0]({ name: 'bash', arguments: { command: 'echo hello' } }), /能力已被此对话关闭/)
+  assert.equal(h.created.filter(item => item.tools.has('arena_coordination')).length, 1)
+  release()
+  await eventually(async () => (await h.request('GET', '/meetings/m1')).data.meeting.status === 'paused')
+  assert.equal((await h.request('GET', '/meetings/m1')).data.meeting.run.currentTaskId, taskId)
 })
 
 test('API errors and system events carry descriptors without changing user messages', async t => {

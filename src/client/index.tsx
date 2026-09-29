@@ -10,6 +10,14 @@ import type { MessageDescriptor, UiNotice } from './i18n'
 const API_ROOT = '/api/plugins/dsh-agent-arena'
 const OPEN_EVENT = 'dsh-agent-arena:open'
 const BUSY_MEETINGS = new Set(['queued', 'running', 'pausing'])
+const CAPABILITY_KEYS = ['files', 'terminal', 'network', 'subagents', 'collaboration', 'skillsMcp'] as const
+
+function participantCapabilitySummary(capabilities?: Record<string, boolean>): string {
+  const enabled = CAPABILITY_KEYS
+    .filter(key => capabilities?.[key] !== false)
+    .map(key => t(`board.capabilities.${key}`))
+  return enabled.join(' · ')
+}
 
 interface Participant {
   id?: string
@@ -20,7 +28,9 @@ interface Participant {
   color: string
   provider?: string
   model?: string
+  compressionMode?: 'dsh' | 'server'
   status?: string
+  capabilities?: Record<string, boolean>
 }
 
 interface Template {
@@ -116,6 +126,32 @@ interface MeetingArtifact {
   updatedAt: string
 }
 
+interface MeetingContextSettings {
+  autoCompressEnabled: boolean
+  autoCompressThreshold: number
+}
+
+interface MeetingRun {
+  id: string | null
+  status: string
+  phase: string
+  currentTaskId?: string | null
+  lastTargetIds?: string[]
+  attempt?: number
+  startedAt?: string | null
+  updatedAt?: string | null
+}
+
+interface RoleStats {
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  failures: number
+  retries: number
+  intentChecks: number
+  lastDurationMs: number
+}
+
 interface Meeting {
   id: string
   workdir?: string
@@ -133,12 +169,19 @@ interface Meeting {
   verdict: Verdict | null
   error: string | null
   createdAt: string
+  updatedAt?: string
   activityMonitor?: ActivityMonitor
   collaborationStage?: MeetingStage
   tasks?: MeetingTask[]
   decisions?: MeetingDecision[]
   artifacts?: MeetingArtifact[]
   permissions?: Record<string, string>
+  capabilities?: Record<string, Record<string, boolean>>
+  contextSettings?: MeetingContextSettings
+  contextSummary?: string
+  contextSummaryUpdatedAt?: string | null
+  contextCompressionCount?: number
+  run?: MeetingRun
 }
 
 interface ArenaSettings {
@@ -164,9 +207,11 @@ interface UserProfile {
   role?: string
   provider?: string
   model?: string
+  compressionMode?: 'dsh' | 'server' | ''
   color?: string
   presetPrompts?: string[]
   autoReplyDisabled?: boolean
+  capabilities?: Record<string, boolean>
 }
 
 interface ApprovalRequest {
@@ -211,6 +256,7 @@ interface ChatRoom {
   updatedAt: string
   activityMonitor?: ActivityMonitor
   permissions?: Record<string, string>
+  capabilities?: Record<string, Record<string, boolean>>
 }
 
 interface RoleActivityEvent {
@@ -237,6 +283,7 @@ interface RoleActivity {
   recent: RoleActivityEvent[]
   history?: RoleActivityEvent[]
   updatedAt: string
+  stats?: RoleStats
 }
 
 interface ActivityMonitor {
@@ -633,6 +680,8 @@ function SetupView(props: {
       color: profile.color || '#6f5ee8',
       provider: profile.provider,
       model: profile.model,
+      compressionMode: profile.compressionMode === 'server' ? 'server' : 'dsh',
+      capabilities: profile.capabilities,
     }
     setParticipants(items => [...items, next])
     setError('')
@@ -739,8 +788,8 @@ function SetupView(props: {
                   <Avatar value={participant.avatar} name={participant.name} className="arena-avatar--medium" />
                   <span className="arena-selected-card__copy">
                     <strong>{participant.name}</strong>
-                    <small>{participant.role}</small>
-                    <em>{participant.provider}/{participant.model}</em>
+                    <small>{participant.provider}/{participant.model}</small>
+                    <em className="arena-selected-card__capabilities">{participantCapabilitySummary(participant.capabilities)}</em>
                   </span>
                   <button type="button" aria-label={t("meeting.remove.value", { p0: participant.name })} onClick={() => { setParticipants(items => items.filter(item => item.profileId !== participant.profileId)); setError(''); setFieldErrors(current => ({ ...current, participants: '' })) }}>×</button>
                 </div>
@@ -761,6 +810,21 @@ function SetupView(props: {
   )
 }
 
+function CompressionModePicker(props: { name: string; value?: UserProfile['compressionMode']; error?: UiNotice; onChange: (mode: 'dsh' | 'server') => void }): ReactNode {
+  const { value, error, onChange } = props
+  return <fieldset className={`arena-compression-picker ${error ? 'has-error' : ''}`}>
+    <legend>{t("users.compression.mode")} <b>{t("users.required")}</b> <span title={t("users.compression.notice")} aria-label={t("users.compression.notice")}>!</span></legend>
+    <div className="arena-compression-picker__options">
+      {(['dsh', 'server'] as const).map(mode => <label key={mode} className={value === mode ? 'is-selected' : ''}>
+        <input type="radio" name={props.name} checked={value === mode} onChange={() => onChange(mode)} />
+        <span><strong>{t(`users.compression.${mode}`)}</strong><small>{t(`users.compression.${mode}.help`)}</small></span>
+      </label>)}
+    </div>
+    <small className="arena-compression-picker__note">{t("users.compression.notice")}</small>
+    {error ? <small className="arena-field-error">{errorText(error)}</small> : null}
+  </fieldset>
+}
+
 function ProfilesView(props: {
   profiles?: ArenaState['profiles']
   modelCatalog: ModelCatalogEntry[]
@@ -779,11 +843,11 @@ function ProfilesView(props: {
   const [administrator, setAdministrator] = useState<UserProfile>(profiles?.administrator ?? {
     id: 'administrator', name: t("users.administrator"), avatar: '🛡️',
     role: '维护协作秩序，并按人类用户要求调整话题、协作阶段与决策状态。',
-    provider: initialProvider, model: defaultModel?.model || initialModels[0]?.id || '',
+    provider: initialProvider, model: defaultModel?.model || initialModels[0]?.id || '', compressionMode: 'dsh',
   })
   const [draft, setDraft] = useState<UserProfile>({
     id: '', name: '', avatar: '🤖', role: '', provider: initialProvider,
-    model: defaultModel?.model || initialModels[0]?.id || '', color: '#6f5ee8', presetPrompts: [],
+    model: defaultModel?.model || initialModels[0]?.id || '', compressionMode: '', color: '#6f5ee8', presetPrompts: [],
   })
   const [savingHuman, setSavingHuman] = useState(false)
   const [savingAdministrator, setSavingAdministrator] = useState(false)
@@ -797,8 +861,8 @@ function ProfilesView(props: {
   }, [profiles?.human?.name, profiles?.human?.avatar])
 
   useEffect(() => {
-    if (profiles?.administrator) setAdministrator(profiles.administrator)
-  }, [profiles?.administrator?.name, profiles?.administrator?.avatar, profiles?.administrator?.provider, profiles?.administrator?.model])
+    if (profiles?.administrator) setAdministrator({ ...profiles.administrator, compressionMode: profiles.administrator.compressionMode || 'dsh' })
+  }, [profiles?.administrator?.name, profiles?.administrator?.avatar, profiles?.administrator?.provider, profiles?.administrator?.model, profiles?.administrator?.compressionMode])
 
   useEffect(() => {
     if (settings) setPreferences(settings)
@@ -816,7 +880,7 @@ function ProfilesView(props: {
   const resetDraft = (): void => {
     setDraft({
       id: '', name: '', avatar: '🤖', role: '', provider: initialProvider,
-      model: defaultModel?.model || initialModels[0]?.id || '', color: '#6f5ee8', presetPrompts: [],
+      model: defaultModel?.model || initialModels[0]?.id || '', compressionMode: '', color: '#6f5ee8', presetPrompts: [],
     })
     setProfileErrors({})
     setMessage('')
@@ -848,6 +912,7 @@ function ProfilesView(props: {
     if (!administrator.name.trim()) nextErrors.administratorName = notice("users.please.enter.the.administrator.s.display.name")
     if (!administrator.provider) nextErrors.administratorProvider = notice("users.please.choose.a.provider.for.the.administrator")
     if (!administrator.model) nextErrors.administratorModel = notice("users.please.choose.a.model.for.the.administrator")
+    if (!administrator.compressionMode) nextErrors.administratorCompression = notice("users.choose.compression.mode")
     if (Object.keys(nextErrors).length) {
       setProfileErrors(current => ({ ...current, ...nextErrors }))
       setMessage(notice("users.the.administrator.configuration.is.incomplete"))
@@ -876,6 +941,7 @@ function ProfilesView(props: {
     if (!draft.name.trim()) nextErrors.name = notice("users.please.enter.a.display.name.for.this.ai")
     if (!draft.provider) nextErrors.provider = modelCatalog.length ? notice("users.please.choose.a.provider") : notice("users.no.providers.are.available.in.dsh.configure.a.model")
     if (!draft.model) nextErrors.model = modelCatalog.length ? notice("users.please.choose.a.model") : notice("users.configure.a.provider.before.choosing.a.model")
+    if (!draft.compressionMode) nextErrors.compression = notice("users.choose.compression.mode")
     if (Object.keys(nextErrors).length) {
       setProfileErrors(nextErrors)
       setMessage(notice("users.the.ai.user.cannot.be.created.yet.complete.the"))
@@ -932,6 +998,7 @@ function ProfilesView(props: {
             <label className={`arena-field ${profileErrors.administratorName ? 'has-error' : ''}`}><span>{t("users.display.name")} <b>{t("users.required")}</b></span><input className="arena-input" value={administrator.name} maxLength={24} onChange={event => { setAdministrator(current => ({ ...current, name: event.target.value })); setProfileErrors(current => ({ ...current, administratorName: '' })) }} /></label>
             <label className="arena-field"><span>{t("users.administrator.responsibilities")}</span><textarea className="arena-textarea" value={administrator.role ?? ''} maxLength={16000} onChange={event => setAdministrator(current => ({ ...current, role: event.target.value }))} /></label>
             <label className="arena-toggle arena-toggle--admin"><input type="checkbox" checked={preferences.autoReplyEnabled} onChange={event => setPreferences(current => ({ ...current, autoReplyEnabled: event.target.checked }))} /><span><strong>{t("users.automatic.follow.up.replies")}</strong><small>{t("users.when.enabled.the.original.allocation.flow.is.used.ai")}<br />{t("users.turning.this.off.stops.automatic.ai.to.ai.follow")}</small></span></label>
+            <CompressionModePicker name="administrator-compression" value={administrator.compressionMode} error={profileErrors.administratorCompression} onChange={compressionMode => { setAdministrator(current => ({ ...current, compressionMode })); setProfileErrors(current => ({ ...current, administratorCompression: '' })) }} />
 
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.administratorProvider ? 'has-error' : ''}`}><span>{t("users.provider")} <b>{t("users.required")}</b></span><select className="arena-select" value={administrator.provider ?? ''} onChange={event => {
@@ -952,7 +1019,7 @@ function ProfilesView(props: {
         <div className="arena-ai-library">
           {profiles?.aiUsers.map(profile => (
             <div className={`arena-ai-card ${draft.id === profile.id ? 'is-active' : ''}`} key={profile.id}>
-              <button type="button" onClick={() => { setDraft({ ...profile }); setProfileErrors({}); setMessage('') }}>
+              <button type="button" onClick={() => { setDraft({ ...profile, compressionMode: profile.compressionMode || 'dsh' }); setProfileErrors({}); setMessage('') }}>
                 <Avatar value={profile.avatar} name={profile.name} className="arena-avatar--medium" />
                 <span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span>
               </button>
@@ -969,6 +1036,8 @@ function ProfilesView(props: {
             <label className="arena-field"><span>{t("users.custom.persona")} <em>{t("users.optional.up.to.16.000.characters")}</em></span><textarea className="arena-textarea" value={draft.role ?? ''} maxLength={16000} placeholder={t("users.optional.persona.cards.with.user.and.char.placeholders.are")} onChange={event => { setDraft(current => ({ ...current, role: event.target.value })); setMessage('') }} /></label>
              <label className="arena-field"><span>{t("users.quick.conversation.starters.one.per.line.up.to.8")}</span><textarea className="arena-textarea arena-preset-textarea" value={(draft.presetPrompts ?? []).join('\n')} placeholder={t("users.help.me.analyze.this.idea.roast.it.in.your")} onChange={event => setDraft(current => ({ ...current, presetPrompts: event.target.value.split('\n').slice(0, 8) }))} /></label>
             <label className="arena-toggle arena-toggle--ai-reply"><input type="checkbox" checked={draft.autoReplyDisabled === true} onChange={event => setDraft(current => ({ ...current, autoReplyDisabled: event.target.checked }))} /><span><strong>{t("users.disable.this.ai.s.independent.follow.up.check")}</strong><small>{t("users.this.ai.can.still.reply.automatically.but.the.administrator")}<br />{t("users.disabling.this.check.can.save.tokens")}</small></span></label>
+            <CompressionModePicker name="ai-compression" value={draft.compressionMode} error={profileErrors.compression} onChange={compressionMode => { setDraft(current => ({ ...current, compressionMode })); setProfileErrors(current => ({ ...current, compression: '' })); setMessage('') }} />
+            <div className="arena-capabilities"><strong>{t("board.capabilities")}</strong><small>{t("board.capabilities.note")}</small><div>{CAPABILITY_KEYS.map(key => <label key={key}><input type="checkbox" checked={draft.capabilities?.[key] !== false} onChange={event => setDraft(current => ({ ...current, capabilities: { ...current.capabilities, [key]: event.target.checked } }))} />{t(`board.capabilities.${key}`)}</label>)}</div></div>
             <div className="arena-model-picker">
               <label className={`arena-field ${profileErrors.provider ? 'has-error' : ''}`}>
                 <span>{t("users.provider")} <b>{t("users.required")}</b></span>
@@ -1154,14 +1223,17 @@ function activityTime(value: string): string {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<string, string>; onPermission?: (profileId: string, mode: string) => Promise<void> }): ReactNode {
-  const { permissions, onPermission } = props
+function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<string, string>; capabilities?: Record<string, Record<string, boolean>>; onPermission?: (profileId: string, mode: string) => Promise<void>; onCapability?: (profileId: string, capability: string, enabled: boolean) => Promise<void> }): ReactNode {
+  const { permissions, onPermission, capabilities, onCapability } = props
   const roles = props.monitor?.roles ?? []
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [historyRole, setHistoryRole] = useState<RoleActivity | null>(null)
   const [permissionDrafts, setPermissionDrafts] = useState<Record<string, string>>({})
   const [permissionBusy, setPermissionBusy] = useState<Record<string, boolean>>({})
   const [permissionErrors, setPermissionErrors] = useState<Record<string, UiNotice>>({})
+  const [capabilityDrafts, setCapabilityDrafts] = useState<Record<string, boolean>>({})
+  const [capabilityBusy, setCapabilityBusy] = useState<Record<string, boolean>>({})
+  const [capabilityErrors, setCapabilityErrors] = useState<Record<string, UiNotice>>({})
 
   useEffect(() => {
     setExpanded(current => {
@@ -1194,6 +1266,22 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
     })
   }, [permissions])
 
+  useEffect(() => {
+    setCapabilityDrafts(current => {
+      const next = { ...current }
+      let changed = false
+      for (const [entry, enabled] of Object.entries(current)) {
+        const delimiter = entry.lastIndexOf(':')
+        const profileId = entry.slice(0, delimiter)
+        const capability = entry.slice(delimiter + 1)
+        if ((capabilities?.[profileId]?.[capability] !== false) !== enabled) continue
+        delete next[entry]
+        changed = true
+      }
+      return changed ? next : current
+    })
+  }, [capabilities])
+
   const changePermission = async (profileId: string, mode: string): Promise<void> => {
     if (!onPermission) return
     setPermissionDrafts(current => ({ ...current, [profileId]: mode }))
@@ -1206,6 +1294,22 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
       setPermissionErrors(current => ({ ...current, [profileId]: captureError(cause) }))
     } finally {
       setPermissionBusy(current => ({ ...current, [profileId]: false }))
+    }
+  }
+
+  const changeCapability = async (profileId: string, capability: string, enabled: boolean): Promise<void> => {
+    if (!onCapability) return
+    const entry = `${profileId}:${capability}`
+    setCapabilityDrafts(current => ({ ...current, [entry]: enabled }))
+    setCapabilityBusy(current => ({ ...current, [entry]: true }))
+    setCapabilityErrors(current => ({ ...current, [entry]: '' }))
+    try {
+      await onCapability(profileId, capability, enabled)
+    } catch (cause) {
+      setCapabilityDrafts(current => { const next = { ...current }; delete next[entry]; return next })
+      setCapabilityErrors(current => ({ ...current, [entry]: captureError(cause) }))
+    } finally {
+      setCapabilityBusy(current => ({ ...current, [entry]: false }))
     }
   }
 
@@ -1236,6 +1340,8 @@ function RoleMonitor(props: { monitor?: ActivityMonitor; permissions?: Record<st
                 <div className="arena-role-activity__body">
                   {role.detail ? <p>{role.detailI18n ? systemText(role.detail, role.detailI18n) : role.detail}</p> : <p className="is-muted">{t("activity.no.further.details")}</p>}
                   {role.currentTool ? <div className="arena-role-tool"><span>{t("activity.current.tool")}</span><code>{systemText(role.currentTool, role.currentToolI18n)}</code></div> : null}
+                  {role.stats ? <div className="arena-role-stats"><span>{t("board.stats.title")}</span><div><b>{role.stats.requests}</b><small>{t("board.stats.requests")}</small><b>{(role.stats.inputTokens + role.stats.outputTokens).toLocaleString()}</b><small>Token</small><b>{role.stats.intentChecks ?? 0}</b><small>{t("board.stats.intentChecks")}</small><b>{role.stats.failures}</b><small>{t("board.stats.errors")}</small><b>{role.stats.retries}</b><small>{t("board.stats.retries")}</small></div>{role.stats.lastDurationMs ? <small>{t("board.stats.last.duration", { p0: (role.stats.lastDurationMs / 1000).toFixed(1) })}</small> : null}</div> : null}
+                  {onCapability && role.profileId !== 'administrator' ? <div className="arena-capabilities"><strong>{t("board.capabilities")}</strong><small>{t("board.capabilities.note")}</small><div>{CAPABILITY_KEYS.map(key => { const entry = `${role.profileId}:${key}`; return <label key={key}><input type="checkbox" disabled={capabilityBusy[entry] === true} checked={capabilityDrafts[entry] ?? (capabilities?.[role.profileId]?.[key] !== false)} onChange={event => void changeCapability(role.profileId, key, event.target.checked)} />{t(`board.capabilities.${key}`)}</label> })}</div>{CAPABILITY_KEYS.some(key => capabilityErrors[`${role.profileId}:${key}`]) ? <small className="is-error">{t("board.capabilities.save.failed")}</small> : null}</div> : null}
                   {role.claimedFiles.length ? <div className="arena-role-files"><span>{t("activity.locked.files")}</span>{role.claimedFiles.map(file => <code key={file} title={file}>🔒 {compactFilePath(file)}</code>)}</div> : null}
                   {role.recent.length ? <div className="arena-role-events"><span>{t("activity.recent.actions")}</span>{[...role.recent].reverse().slice(0, 6).map(event => <div data-kind={event.kind} key={event.id}><i /><p>{systemText(event.text, event.i18n)}</p><time>{activityTime(event.createdAt)}</time></div>)}</div> : null}
                   <button className="arena-role-history-button" type="button" onClick={() => setHistoryRole(role)}>{t("activity.view.action.history")}{role.history?.length ? `（${role.history.length}）` : ''}</button>
@@ -1329,8 +1435,9 @@ function ChatView(props: {
   onDelete: () => Promise<void>
   onApproval: (approvalId: string, outcome: 'allowed-once' | 'rejected', note?: string) => Promise<void>
   onPermission: (profileId: string, mode: string) => Promise<void>
+  onCapability: (profileId: string, capability: string, enabled: boolean) => Promise<void>
 }): ReactNode {
-  const { room, profiles, onSend, onRetry, onRename, onSetWorkdir, onInvite, onDelete, onApproval, onPermission } = props
+  const { room, profiles, onSend, onRetry, onRename, onSetWorkdir, onInvite, onDelete, onApproval, onPermission, onCapability } = props
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<UiNotice>('')
@@ -1339,6 +1446,9 @@ function ChatView(props: {
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsError, setSettingsError] = useState<UiNotice>('')
+  const [capabilityDrafts, setCapabilityDrafts] = useState<Record<string, boolean>>({})
+  const [capabilityBusy, setCapabilityBusy] = useState<Record<string, boolean>>({})
+  const [capabilityErrors, setCapabilityErrors] = useState<Record<string, UiNotice>>({})
   const [monitorWidth, setMonitorWidth] = useState(310)
   const scrollRef = useRef<HTMLDivElement>(null)
   const chatLayoutRef = useRef<HTMLDivElement>(null)
@@ -1351,6 +1461,37 @@ function ChatView(props: {
   const availableInvitees = (profiles?.aiUsers ?? []).filter(profile => !room.participants.some(item => item.id === profile.id))
 
   useEffect(() => { setRoomName(room.name) }, [room.name])
+
+  useEffect(() => {
+    setCapabilityDrafts(current => {
+      const next = { ...current }
+      let changed = false
+      for (const [entry, enabled] of Object.entries(current)) {
+        const delimiter = entry.lastIndexOf(':')
+        const profileId = entry.slice(0, delimiter)
+        const capability = entry.slice(delimiter + 1)
+        if ((room.capabilities?.[profileId]?.[capability] !== false) !== enabled) continue
+        delete next[entry]
+        changed = true
+      }
+      return changed ? next : current
+    })
+  }, [room.capabilities])
+
+  const changeCapability = async (profileId: string, capability: string, enabled: boolean): Promise<void> => {
+    const entry = `${profileId}:${capability}`
+    setCapabilityDrafts(current => ({ ...current, [entry]: enabled }))
+    setCapabilityBusy(current => ({ ...current, [entry]: true }))
+    setCapabilityErrors(current => ({ ...current, [entry]: '' }))
+    try {
+      await onCapability(profileId, capability, enabled)
+    } catch (cause) {
+      setCapabilityDrafts(current => { const next = { ...current }; delete next[entry]; return next })
+      setCapabilityErrors(current => ({ ...current, [entry]: captureError(cause) }))
+    } finally {
+      setCapabilityBusy(current => ({ ...current, [entry]: false }))
+    }
+  }
 
   useEffect(() => {
     const element = scrollRef.current
@@ -1432,6 +1573,7 @@ function ChatView(props: {
           <WorkdirSettings key={room.id} value={room.workdir} onSave={onSetWorkdir} />
           {room.type === 'group' ? <section><div className="arena-chat-settings__section"><strong>{t("chat.invite.ai.users")}</strong><span>{t("counts.inviteCapacity", { count: room.participants.length })}</span></div>{availableInvitees.length ? <div className="arena-invite-list">{availableInvitees.map(profile => <button type="button" key={profile.id} className={inviteIds.includes(profile.id) ? 'is-active' : ''} onClick={() => setInviteIds(current => current.includes(profile.id) ? current.filter(id => id !== profile.id) : room.participants.length + current.length < 12 ? [...current, profile.id] : current)}><Avatar value={profile.avatar} name={profile.name} /><span><strong>{profile.name}</strong><small>{profile.provider}/{profile.model}</small></span><i>{inviteIds.includes(profile.id) ? '✓' : '+'}</i></button>)}</div> : <div className="arena-invite-empty">{t("chat.there.are.no.more.ai.users.available.to.invite")}</div>}<button className="arena-launch arena-invite-submit" type="button" disabled={settingsBusy || !inviteIds.length} onClick={() => void inviteMembers()}>{settingsBusy ? t("chat.processing") : t("chat.invite.value.selected.members", { p0: inviteIds.length || '' })}</button></section> : null}
           <section className="arena-permission-section"><div className="arena-chat-settings__section"><strong>{t("chat.agent.permissions.for.this.chat")}</strong><span>{t("chat.per.conversation.defaults.to.full.access")}</span></div>{room.participants.map(profile => <label className="arena-permission-row" key={profile.id}><Avatar value={profile.avatar} name={profile.name} /><span>{profile.name}</span><select value={room.permissions?.[profile.id] || 'danger-full-access'} onChange={event => void onPermission(profile.id, event.target.value)}><option value="read-only">{t("permissions.readOnly")}</option><option value="workspace-write">{t("permissions.workspaceWrite")}</option><option value="danger-full-access">{t("permissions.fullAccess")}</option></select></label>)}</section>
+          <section className="arena-chat-capabilities"><strong>{t("board.capabilities")}</strong><small>{t("board.capabilities.note")}</small>{room.participants.map(profile => <div className="arena-capabilities" key={profile.id}><strong>{profile.name}</strong><div>{CAPABILITY_KEYS.map(key => { const entry = `${profile.id}:${key}`; return <label key={key}><input type="checkbox" disabled={capabilityBusy[entry] === true} checked={capabilityDrafts[entry] ?? (room.capabilities?.[profile.id]?.[key] !== false)} onChange={event => void changeCapability(profile.id, key, event.target.checked)} />{t(`board.capabilities.${key}`)}</label> })}</div>{CAPABILITY_KEYS.some(key => capabilityErrors[`${profile.id}:${key}`]) ? <small className="is-error">{t("board.capabilities.save.failed")}</small> : null}</div>)}</section>
           {settingsError ? <div className="arena-error">{errorText(settingsError)}</div> : null}
         </aside>
       ) : null}
@@ -1576,6 +1718,108 @@ function HistoryView(props: {
 
 type WorkspaceTab = 'activity' | 'tasks' | 'decisions' | 'artifacts'
 
+interface MeetingContextSnapshot {
+  estimatedTokens: number
+  contextWindow: number | null
+  percent: number | null
+  totalMessages: number
+  uncompressedMessages: number
+  breakdown: Record<string, number>
+  summary: string
+  summaryUpdatedAt: string | null
+  compressionCount: number
+  roles: MeetingRoleContextSnapshot[]
+  settings: MeetingContextSettings
+}
+
+interface MeetingRoleContextSnapshot {
+  profileId: string
+  name: string
+  avatar: string
+  provider?: string
+  model?: string
+  compressionMode?: 'dsh' | 'server'
+  active?: boolean
+  estimatedTokens: number
+  contextWindow: number | null
+  percent: number | null
+  totalMessages: number
+  uncompressedMessages: number
+  breakdown: Record<string, number>
+  summary: string
+  summaryUpdatedAt: string | null
+  compressionCount: number
+}
+
+function MeetingContextPanel(props: { meeting: Meeting; busy: boolean; onAction: (body: object) => Promise<boolean> }): ReactNode {
+  const { meeting, busy, onAction } = props
+  const [snapshot, setSnapshot] = useState<MeetingContextSnapshot | null>(null)
+  const [compressing, setCompressing] = useState(false)
+  const [compressingRole, setCompressingRole] = useState('')
+  const [threshold, setThreshold] = useState(meeting.contextSettings?.autoCompressThreshold ?? 80)
+  const settings = meeting.contextSettings ?? { autoCompressEnabled: false, autoCompressThreshold: 80 }
+  useEffect(() => { setThreshold(settings.autoCompressThreshold) }, [meeting.id, settings.autoCompressThreshold])
+
+  const refresh = async (): Promise<void> => {
+    try {
+      const result = await jsonRequest<{ context: MeetingContextSnapshot }>(`/meetings/${encodeURIComponent(meeting.id)}/context`)
+      setSnapshot(result.context)
+    } catch {
+      setSnapshot(null)
+    }
+  }
+  useEffect(() => { void refresh() }, [meeting.id, meeting.updatedAt, meeting.contextCompressionCount])
+
+  const compress = async (profileId: string): Promise<void> => {
+    setCompressing(true); setCompressingRole(profileId)
+    try {
+      if (await onAction({ action: 'compress-context', profileId })) await refresh()
+    } finally { setCompressing(false); setCompressingRole('') }
+  }
+  const saveSettings = async (enabled: boolean, nextThreshold = threshold): Promise<void> => {
+    const normalized = Math.max(50, Math.min(95, Math.round(nextThreshold)))
+    if (await onAction({ action: 'set-context-settings', autoCompressEnabled: enabled, autoCompressThreshold: normalized })) {
+      setThreshold(normalized)
+      await refresh()
+    }
+  }
+  const roles = snapshot?.roles ?? []
+  return <section className="arena-context-panel">
+    <div className="arena-context-panel__head">
+      <div><h3>{t("board.context.usage")}</h3><p>{t("board.context.each.role.independent")}</p></div>
+    </div>
+    {snapshot ? <>
+      <div className="arena-context-roles">
+        {roles.map(role => {
+          const rolePercent = role.percent ?? null
+          const roleUsageWidth = rolePercent === null ? 0 : Math.min(100, Math.max(0, rolePercent))
+          return <details className="arena-context-role" key={role.profileId} defaultOpen>
+            <summary>
+              <Avatar value={role.avatar} name={role.name} />
+              <span><strong>{role.name}</strong><small>{role.provider && role.model ? `${role.provider}/${role.model}` : t("board.context.no.data")}</small></span>
+              <em>{role.active ? t("board.context.active") : t("board.context.session.idle")}</em>
+              <b>{role.estimatedTokens.toLocaleString()}{rolePercent !== null ? ` · ${rolePercent}%` : ''}</b>
+            </summary>
+            <div className="arena-context-role__body">
+              <small>{t(role.compressionMode === 'server' ? "users.compression.server" : "users.compression.dsh")}</small>
+              <div className="arena-context-meter"><span style={{ width: `${roleUsageWidth}%` }} data-high={rolePercent !== null && rolePercent >= 80} /></div>
+              <div className="arena-context-values"><strong>{t("board.context.used", { p0: role.estimatedTokens.toLocaleString() })}</strong><span>{role.contextWindow ? t("board.context.window", { p0: role.contextWindow.toLocaleString() }) : t("board.context.no.data")}{rolePercent !== null ? ` · ${rolePercent}%` : ''}</span></div>
+              {!role.contextWindow ? <small>{t("board.context.unknown.window.fallback")}</small> : null}
+              <div className="arena-context-role__actions"><span className="arena-context-button-help" title={role.compressionMode === 'server' ? t("board.context.server.no.manual") : !role.active ? t("board.context.no.active.session") : ''}><button type="button" disabled={busy || compressing || role.compressionMode === 'server' || !role.active} onClick={() => void compress(role.profileId)}>{compressingRole === role.profileId ? t("board.context.compressing") : t("board.context.compress")}</button></span><span>{t("board.context.uncompressed", { p0: role.uncompressedMessages.toLocaleString() })}</span></div>
+              <details className="arena-context-breakdown"><summary>{t("board.context.breakdown")}</summary><div>{Object.entries(role.breakdown).map(([key, value]) => <span key={key}><b>{t(`board.context.part.${key}`)}</b><em>{value.toLocaleString()}</em></span>)}</div></details>
+              {role.summary ? <details className="arena-context-summary"><summary>{t("board.context.summary")}</summary><pre>{role.summary}</pre></details> : null}
+              {role.summaryUpdatedAt ? <small>{t("board.context.last.compressed", { p0: activityTime(role.summaryUpdatedAt) })}</small> : null}
+            </div>
+          </details>
+        })}
+      </div>
+    </> : <div className="arena-workspace-empty">{t("board.context.no.data")}</div>}
+    <label className="arena-context-toggle"><input type="checkbox" checked={settings.autoCompressEnabled} disabled={busy} onChange={event => void saveSettings(event.target.checked)} /><span><strong>{t("board.context.auto.compress")}</strong><small>{t("board.context.auto.compress.description")}</small></span></label>
+    <label className="arena-context-threshold"><span>{t("board.context.auto.compress.threshold")}: {threshold}%</span><input type="range" min={50} max={95} step={5} value={threshold} disabled={busy || !settings.autoCompressEnabled} onChange={event => setThreshold(Number(event.target.value))} /></label>
+    <button className="arena-context-save" type="button" disabled={busy || threshold === settings.autoCompressThreshold} onClick={() => void saveSettings(settings.autoCompressEnabled)}>{t("history.save")}</button>
+  </section>
+}
+
 function CollaborationConsole(props: {
   meeting: Meeting
   busy: boolean
@@ -1599,6 +1843,7 @@ function CollaborationConsole(props: {
   const [artifactDescription, setArtifactDescription] = useState('')
   const [artifactLocation, setArtifactLocation] = useState('')
   const [artifactType, setArtifactType] = useState<MeetingArtifact['artifactType']>('note')
+  const [expandedOptions, setExpandedOptions] = useState<Record<string, boolean>>({})
   const [sectionHeights, setSectionHeights] = useState<Record<Exclude<WorkspaceTab, 'activity'>, number>>({ tasks: 420, decisions: 520, artifacts: 420 })
   const tasks = meeting.tasks ?? []
   const decisions = meeting.decisions ?? []
@@ -1660,7 +1905,8 @@ function CollaborationConsole(props: {
       </div>
 
       <div className="arena-workspace-scroll">
-        {tab === 'activity' ? <RoleMonitor monitor={meeting.activityMonitor} permissions={meeting.permissions} onPermission={onPermission} /> : null}
+        {tab === 'activity' && meeting.run ? <div className="arena-run-strip"><span><small>{t("board.run.status")}</small><strong>{STATUS_TEXT()[meeting.run.status] || t("board.run.idle")}</strong></span><span><small>{t("board.run.phase")}</small><strong>{meeting.run.currentTaskId ? tasks.find(item => item.id === meeting.run?.currentTaskId)?.title || t("board.run.phase.task") : t(`board.run.phase.${meeting.run.phase}`)}</strong></span>{BUSY_MEETINGS.has(meeting.status) ? <button type="button" disabled={busy || meeting.status === 'pausing'} onClick={() => void onAction({ action: meeting.status === 'running' ? 'pause' : 'stop' })}>{t("board.run.pause")}</button> : <><button type="button" disabled={busy} onClick={() => void onAction({ action: 'resume' })}>{t("board.run.resume")}</button>{meeting.run.lastTargetIds?.length ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'retry' })}>{t("board.run.retry")}</button> : null}</>}</div> : null}
+        {tab === 'activity' ? <><MeetingContextPanel meeting={meeting} busy={busy} onAction={onAction} /><RoleMonitor key={meeting.id} monitor={meeting.activityMonitor} permissions={meeting.permissions} capabilities={meeting.capabilities} onPermission={onPermission} onCapability={async (profileId, capability, enabled) => { if (!await onAction({ action: 'set-capability', profileId, capability, enabled })) throw new Error(t("board.capabilities.save.failed")) }} /></> : null}
 
         {tab === 'tasks' ? <><section className="arena-workspace-section" style={{ height: `${sectionHeights.tasks}px` }}>
           <div className="arena-workspace-section__head"><span><h3>{t("board.task.board")}</h3><p>{blockers.length ? t("board.value.blocked.tasks.need.attention", { p0: blockers.length }) : t("board.assign.owners.and.track.delivery")}</p></span><button type="button" onClick={() => setTaskFormOpen(value => !value)}>{t("board.new")}</button></div>
@@ -1678,8 +1924,8 @@ function CollaborationConsole(props: {
               <select aria-label={t("board.task.status")} value={task.status} disabled={busy} onChange={event => void onAction({ action: 'task-update', taskId: task.id, status: event.target.value })}>{(Object.keys(TASK_STATUS_TEXT()) as TaskStatus[]).map(status => <option value={status} key={status}>{TASK_STATUS_TEXT()[status]}</option>)}</select>
             </div>
             <div className="arena-card-actions">
-              {task.status === 'todo' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.start.task")}</button> : null}
-              {task.status === 'paused' ? <button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.continue.task")}</button> : null}
+              {task.status === 'todo' ? <button className="is-primary" type="button" disabled={busy || !task.assigneeId || task.assigneeId === 'administrator'} title={!task.assigneeId || task.assigneeId === 'administrator' ? t("board.run.task.requires.owner") : ''} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.start.task")}</button> : null}
+              {task.status === 'paused' ? <button className="is-primary" type="button" disabled={busy || !task.assigneeId || task.assigneeId === 'administrator'} title={!task.assigneeId || task.assigneeId === 'administrator' ? t("board.run.task.requires.owner") : ''} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.continue.task")}</button> : null}
               {task.status === 'in-progress' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'paused' })}>{t("board.pause.task")}</button> : null}
               {task.status === 'blocked' ? <><button className="is-primary" type="button" disabled={busy} onClick={() => void onAction({ action: 'task-update', taskId: task.id, status: 'in-progress' })}>{t("board.rework")}</button><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.blocked.task.value", { p0: task.title }) })}>{t("board.request.review")}</button></> : null}
               <button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(t("board.delete.task.value", { p0: task.title }))) void onAction({ action: 'task-delete', taskId: task.id }) }}>{t("history.delete")}</button>
@@ -1696,14 +1942,23 @@ function CollaborationConsole(props: {
             <textarea className="arena-textarea" value={decisionOptions} placeholder={t("board.one.option.per.line.at.least.two.option.a")} onChange={event => setDecisionOptions(event.target.value)} />
             <div><button className="is-primary" type="button" disabled={busy || !decisionTitle.trim() || decisionOptions.split('\n').filter(item => item.trim()).length < 2} onClick={() => void createDecision()}>{t("board.create.decision")}</button><button type="button" onClick={() => setDecisionFormOpen(false)}>{t("avatar.cancel")}</button></div>
           </div> : null}
-          <div className="arena-decision-list">{decisions.map(decision => <article className="arena-decision-card" data-status={decision.status} key={decision.id}>
+            <div className="arena-decision-list">{decisions.map(decision => <article className="arena-decision-card" data-status={decision.status} key={decision.id}>
             <div className="arena-decision-card__head"><span><strong>{decision.title}</strong><small>{decision.status === 'decided' ? t("board.decided") : t("board.awaiting.your.choice")}</small></span>{decision.status === 'decided' ? <button type="button" disabled={busy} onClick={() => void onAction({ action: 'decision-reopen', decisionId: decision.id })}>{t("board.reopen.discussion")}</button> : null}</div>
             {decision.description ? <p>{decision.description}</p> : null}
-            <div className="arena-option-list">{decision.options.map(option => {
+            <div className="arena-decision-summary"><span>{t("board.decision.summary", { p0: decision.options.length, p1: decision.options.reduce((sum, option) => sum + (option.opinions?.length ?? 0), 0) })}</span><span>{decision.selectedOptionId ? t("board.selected") : t("board.awaiting.your.choice")}</span></div>
+            <div className="arena-option-list">{[...decision.options].sort((a, b) => Number(b.id === decision.selectedOptionId) - Number(a.id === decision.selectedOptionId)).map(option => {
               const selected = decision.selectedOptionId === option.id
+              const optionOpinions = option.opinions ?? []
+              const support = optionOpinions.filter(opinion => opinion.stance === 'support').length
+              const oppose = optionOpinions.filter(opinion => opinion.stance === 'oppose').length
+              const neutral = optionOpinions.filter(opinion => opinion.stance === 'neutral').length
+              const confidence = optionOpinions.length ? Math.round(optionOpinions.reduce((sum, opinion) => sum + opinion.confidence, 0) / optionOpinions.length) : 0
+              const optionOpen = expandedOptions[`${decision.id}:${option.id}`] === true
               return <div className={selected ? 'arena-option is-selected' : 'arena-option'} key={option.id}>
                 <div className="arena-option__head"><span><strong>{option.label}</strong>{option.description ? <small>{option.description}</small> : null}</span><button type="button" disabled={busy || selected} onClick={() => void onAction({ action: 'decision-choose', decisionId: decision.id, optionId: option.id })}>{selected ? t("board.selected") : decision.status === 'decided' ? t("board.change.choice") : t("board.choose.option")}</button></div>
-                {(option.opinions ?? []).map(opinion => <div className="arena-opinion" data-stance={opinion.stance} key={opinion.profileId}><Avatar value={opinion.avatar} name={opinion.name} /><span><strong>{opinion.name} · {opinion.stance === 'support' ? t("board.support") : opinion.stance === 'oppose' ? t("board.oppose") : t("board.neutral")} {t("board.confidence")} {opinion.confidence}%</strong><p>{opinion.reason || t("board.no.reason.provided")}</p>{opinion.risk ? <small>{t("board.risks")}{opinion.risk}</small> : null}</span></div>)}
+                <div className="arena-option__summary">{t("board.decision.option.summary", { p0: support, p1: oppose, p2: neutral, p3: confidence })}</div>
+                {optionOpinions.length ? <button className="arena-option__details" type="button" onClick={() => setExpandedOptions(current => ({ ...current, [`${decision.id}:${option.id}`]: !optionOpen }))}>{optionOpen ? t("board.decision.collapse.details") : t("board.decision.expand.details")}</button> : null}
+                {optionOpen ? optionOpinions.map(opinion => <div className="arena-opinion" data-stance={opinion.stance} key={opinion.profileId}><Avatar value={opinion.avatar} name={opinion.name} /><span><strong>{opinion.name} · {opinion.stance === 'support' ? t("board.support") : opinion.stance === 'oppose' ? t("board.oppose") : t("board.neutral")} {t("board.confidence")} {opinion.confidence}%</strong><p>{opinion.reason || t("board.no.reason.provided")}</p>{opinion.risk ? <small>{t("board.risks")}{opinion.risk}</small> : null}</span></div>) : null}
               </div>
             })}</div>
             <div className="arena-card-actions"><button type="button" disabled={!active || busy} onClick={() => void onAction({ action: 'request-evidence', subject: t("board.decision.value", { p0: decision.title }) })}>{t("board.request.evidence")}</button><button className="is-danger" type="button" disabled={busy} onClick={() => { if (window.confirm(t("board.delete.decision.value", { p0: decision.title }))) void onAction({ action: 'decision-delete', decisionId: decision.id }) }}>{t("history.delete")}</button></div>
@@ -1747,6 +2002,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
   const [inviteIds, setInviteIds] = useState<string[]>([])
   const [workspaceWidth, setWorkspaceWidth] = useState(370)
   const [headerHeight, setHeaderHeight] = useState(82)
+  const [controlsHeight, setControlsHeight] = useState(154)
   const stageRef = useRef<HTMLDivElement>(null)
   const collabRef = useRef<HTMLDivElement>(null)
   const watchRef = useRef<HTMLDivElement>(null)
@@ -1816,6 +2072,26 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
     window.addEventListener('pointerup', stop, { once: true })
   }
 
+  const resizeControls = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const layout = watchRef.current
+    if (!layout) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    const bounds = layout.getBoundingClientRect()
+    const move = (pointer: PointerEvent): void => {
+      const maxHeight = Math.max(180, Math.min(360, bounds.height - 220))
+      setControlsHeight(Math.round(Math.min(maxHeight, Math.max(108, bounds.bottom - pointer.clientY))))
+    }
+    const stop = (): void => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', stop)
+      document.body.classList.remove('arena-is-row-resizing')
+    }
+    document.body.classList.add('arena-is-row-resizing')
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', stop, { once: true })
+  }
+
   const inviteMembers = async (): Promise<void> => {
     if (!inviteIds.length) { setError(notice("chat.select.at.least.one.ai.user.to.invite")); return }
     if (await act({ action: 'invite-members', profileIds: inviteIds })) {
@@ -1828,11 +2104,11 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
     await onAction({ action: 'set-permission', profileId, mode })
   }
 
-  const headerTitleSize = Math.round(Math.min(29, Math.max(13, 13 + (headerHeight - 64) * 0.09)))
-  const headerMetaSize = Math.round(Math.min(13, Math.max(9, 9 + (headerHeight - 64) * 0.025)))
+  const headerTitleSize = Math.round(Math.min(29, Math.max(16, 16 + (headerHeight - 64) * 0.075)))
+  const headerMetaSize = Math.round(Math.min(14, Math.max(12, 12 + (headerHeight - 64) * 0.012)))
 
   return (
-    <div className="arena-watch" ref={watchRef} style={{ '--arena-watch-head-height': `${headerHeight}px`, '--arena-watch-title-size': `${headerTitleSize}px`, '--arena-watch-meta-size': `${headerMetaSize}px` } as CSSProperties}>
+    <div className="arena-watch" ref={watchRef} style={{ '--arena-watch-head-height': `${headerHeight}px`, '--arena-watch-title-size': `${headerTitleSize}px`, '--arena-watch-meta-size': `${headerMetaSize}px`, '--arena-controls-height': `${controlsHeight}px` } as CSSProperties}>
       <div className="arena-watch-head">
         <div className="arena-watch-head__title">
           <h2 title={meeting.topic}>{meetingTitle(meeting)}</h2>
@@ -1908,6 +2184,7 @@ function WatchView(props: { meeting: Meeting; profiles: ArenaState['profiles']; 
         <CollaborationConsole meeting={meeting} busy={busy} active={active} onAction={act} onCompose={setMessage} onPermission={setMeetingPermission} />
       </div>
 
+      <div className="arena-controls-resizer" role="separator" aria-label={t("meeting.resize.the.human.message.area")} aria-orientation="horizontal" aria-valuemin={108} aria-valuemax={360} aria-valuenow={controlsHeight} tabIndex={0} onPointerDown={resizeControls} onKeyDown={event => { if (event.key === 'ArrowUp') { event.preventDefault(); setControlsHeight(height => Math.min(360, height + 10)) } else if (event.key === 'ArrowDown') { event.preventDefault(); setControlsHeight(height => Math.max(108, height - 10)) } }} />
       <div className="arena-controls">
         <div className="arena-intervene arena-intervene--chat">
           <div className="arena-mention-bar"><span>{t("chat.mention")}</span>{meeting.participants.map(participant => { const muted = mutedIds.has(participant.id); return <button type="button" key={participant.id} className={muted ? 'is-muted' : ''} title={muted ? t("chat.value.is.muted.click.to.draft.an.unmute.command", { p0: participant.name }) : `@${participant.name}`} onClick={() => mention(participant.name, muted ? t("chat.you.can.speak.again") : '')}><Avatar value={participant.avatar} name={participant.name} />@{participant.name}{muted ? t("chat.muted") : ''}</button> })}<button type="button" className="is-admin" onClick={() => mention(administrator.name)}><Avatar value={administrator.avatar} name={administrator.name} />@{administrator.name}</button></div>
@@ -2121,6 +2398,11 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
     const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'set-permission', profileId, mode }) })
     setState(current => ({ ...current, rooms: (current.rooms ?? []).map(item => item.id === result.room.id ? result.room : item) }))
   }
+  const setRoomCapability = async (profileId: string, capability: string, enabled: boolean): Promise<void> => {
+    if (!selectedRoom) return
+    const result = await jsonRequest<{ room: ChatRoom }>(`/rooms/${encodeURIComponent(selectedRoom.id)}/actions`, { method: 'POST', body: JSON.stringify({ action: 'set-capability', profileId, capability, enabled }) })
+    setState(current => ({ ...current, rooms: (current.rooms ?? []).map(item => item.id === result.room.id ? result.room : item) }))
+  }
 
   const deleteRoom = async (): Promise<void> => {
     if (!selectedRoom) return
@@ -2245,7 +2527,7 @@ export function ArenaOverlay({ embedded = false }: { embedded?: boolean } = {}):
                  ) : view === 'create-chat' ? (
                   <CreateChatView profiles={state.profiles} initialType={chatType} onManageProfiles={() => setView('profiles')} onCreated={roomCreated} />
                 ) : view === 'chat' && selectedRoom ? (
-                  <ChatView room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onSetWorkdir={setSelectedRoomWorkdir} onInvite={inviteRoomMembers} onDelete={deleteRoom} onApproval={resolveApproval} onPermission={setRoomPermission} />
+                  <ChatView key={selectedRoom.id} room={selectedRoom} profiles={state.profiles} onSend={sendRoomMessage} onRetry={retrySelectedRoom} onRename={renameSelectedRoom} onSetWorkdir={setSelectedRoomWorkdir} onInvite={inviteRoomMembers} onDelete={deleteRoom} onApproval={resolveApproval} onPermission={setRoomPermission} onCapability={setRoomCapability} />
                 ) : view === 'setup' || !selected ? (
                   <SetupView
                     templates={state.templates.length ? state.templates : FALLBACK_TEMPLATES}
