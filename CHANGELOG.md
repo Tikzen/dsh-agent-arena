@@ -6,6 +6,7 @@
 
 - 本标准版本按 **DeepSeek Harness Web 0.1.7-rc.2** 的接口和 Agent 行为开发与验收。
 - 当前 release 只保证 DSH Web `0.1.7-rc.2`；其他 DSH 版本暂不保证兼容，后续会单独制作兼容版 release。
+- 大幅优化 UI 体验。
 
 ### 每个角色独立的上下文使用与压缩
 

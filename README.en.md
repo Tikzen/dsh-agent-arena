@@ -14,6 +14,8 @@ Bring several AI users and a human user into one persistent collaboration space.
 
 This release is developed and checked against **DeepSeek Harness Web 0.1.7-rc.2**. The standard package only guarantees compatibility with DSH Web `0.1.7-rc.2`; other DSH versions are not guaranteed for now. Dedicated compatibility releases for other versions will be developed later.
 
+This release significantly improves the UI experience.
+
 ### Per-role context usage and compression
 
 - The Activity panel now shows estimated tokens, model context window, usage percentage, uncompressed messages, and a detailed breakdown for each role.
