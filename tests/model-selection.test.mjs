@@ -1,6 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { installArenaModelSelection } from '../src/index.mjs'
+import {
+  arenaChannelKey,
+  installArenaModelSelection,
+  isArenaEmptyResponseFailure,
+  isArenaRateLimitFailure,
+  normalizeArenaCooldownStatuses,
+  normalizeArenaRequestLimit,
+} from '../src/index.mjs'
 
 // 模拟 DSH Agent 上下文中与模型选择相关的两个事件。
 function fakeAgentCtx() {
@@ -79,4 +86,40 @@ test('request keeps inherited reasoning effort only when provided', async () => 
   installArenaModelSelection(agentCtx2, { provider: 'p1', model: 'm1' })
   const { request: request2 } = await agentCtx2.runTurn()
   assert.equal(Object.hasOwn(request2, 'reasoningEffort'), false)
+})
+
+test('shared channel key groups different models by provider configuration', () => {
+  assert.equal(arenaChannelKey({ provider: 'oai', model: 'gpt-5.6-sol' }), 'oai')
+  assert.equal(arenaChannelKey({ provider: 'oai', model: 'gpt-5.6-terra' }), 'oai')
+  assert.notEqual(arenaChannelKey({ provider: 'oai', model: 'gpt-5.6-sol' }), arenaChannelKey({ provider: 'deepseek', model: 'deepseek-v4' }))
+})
+
+test('rate-limit detection covers HTTP 429 and provider rate-limit failures', () => {
+  assert.equal(isArenaRateLimitFailure({ status: 429, message: 'Too many requests' }), true)
+  assert.equal(isArenaRateLimitFailure({ code: 'RATE_LIMIT_EXCEEDED', message: 'provider rejected the request' }), true)
+  assert.equal(isArenaRateLimitFailure({ failure: { status: 429, providerRetryAfterMs: 90_000 } }), true)
+  assert.equal(isArenaRateLimitFailure(new Error('500: {"message":"分组 Codex 下模型 gpt-5.6-terra 的可用渠道不存在（retry）","code":"get_channel_failed"}')), true)
+  assert.equal(isArenaRateLimitFailure({ status: 429, message: 'Upstream rate limit exceeded, please retry later' }), true)
+  assert.equal(isArenaRateLimitFailure(new Error('500: 分组 Codex 下模型 gpt-5.6-terra 的可用渠道不存在'), [429]), false)
+  assert.equal(isArenaRateLimitFailure({ status: 500, message: 'internal server error' }), true)
+  assert.equal(isArenaRateLimitFailure({ status: 500, message: 'internal server error' }, [429]), false)
+  assert.equal(isArenaRateLimitFailure({ status: 403, message: 'access denied' }, [403, 429]), true)
+})
+
+test('custom channel request limit and cooldown status list are normalized safely', () => {
+  assert.equal(normalizeArenaRequestLimit(30), 30)
+  assert.equal(normalizeArenaRequestLimit('120'), 120)
+  assert.equal(normalizeArenaRequestLimit(0), 55)
+  assert.equal(normalizeArenaRequestLimit(20_000), 55)
+  assert.deepEqual(normalizeArenaCooldownStatuses([429, '500', 429, 403]), [429, 500, 403])
+  assert.deepEqual(normalizeArenaCooldownStatuses([]), [])
+  assert.deepEqual(normalizeArenaCooldownStatuses(['x', 99, 600]), [])
+})
+
+test('empty-response detection only matches completed responses without content', () => {
+  assert.equal(isArenaEmptyResponseFailure(new Error('model "gpt-5.6-terra" returned a completed response with no content')), true)
+  assert.equal(isArenaEmptyResponseFailure({ code: 'EMPTY_RESPONSE', message: 'empty completion' }), true)
+  assert.equal(isArenaEmptyResponseFailure({ failure: { code: 'EMPTY_RESPONSE' } }), true)
+  assert.equal(isArenaEmptyResponseFailure(new Error('context window exceeded')), false)
+  assert.equal(isArenaEmptyResponseFailure(new Error('rate limit exceeded')), false)
 })

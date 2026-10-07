@@ -1,10 +1,15 @@
+import { uiMessage, messageText as uiText, messageDescriptor, withMessageDetail } from './localization.mjs'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+import { conversationSettingsPatch, normalizeCoordinationFile, normalizeRoomWorkdir, runtimeWorkdir } from './workspace.mjs'
 import {
   API_ROOT,
+  ARENA_CAPABILITY_KEYS,
   ARENA_TEMPLATES,
   ensureMeetingWorkspace,
+  estimateMeetingContext,
+  getMeetingContextState,
   isDuplicateAutonomousMessage,
   isArenaSessionPrompt,
   MEETING_STAGES,
@@ -12,6 +17,8 @@ import {
   cleanAvatar,
   mentionedProfileIds,
   mentionsAdministrator,
+  normalizeCapabilities,
+  normalizeCompressionMode,
   parseSpeechDirectives,
   publicMeeting,
   renderPersonaTemplate,
@@ -28,15 +35,64 @@ const LEGACY_TERMINAL_STATUSES = new Set(['completed', 'stopped', 'failed', 'int
 
 class HttpError extends Error {
   constructor(status, message) {
-    super(message)
+    super(uiText(message))
     this.status = status
+    this.i18n = messageDescriptor(message)
   }
 }
 
 const nowIso = () => new Date().toISOString()
 const safeError = error => error instanceof Error ? error.message : String(error)
 const COOLDOWN_MS = 60_000
+const CHANNEL_WINDOW_MS = 60_000
+const DEFAULT_CHANNEL_REQUEST_LIMIT = 55
+const DEFAULT_COOLDOWN_ERROR_STATUSES = Object.freeze([429, 500])
+const AGENT_PERMISSION_MODES = Object.freeze(['read-only', 'workspace-write', 'danger-full-access'])
+const AGENT_PERMISSION_LABELS = Object.freeze({
+  'read-only': 'Read Only',
+  'workspace-write': 'Workspace Write',
+  'danger-full-access': 'Full access',
+})
 const RATE_LIMIT_RE = /(?:429|rate.?limit|too many requests|频率|限流|请求过于频繁)/i
+const RETRY_CHANNEL_EXHAUSTED_RE = /(?:get_channel_failed|可用渠道不存在[（(]retry[）)]|upstream rate limit exceeded)/i
+const EMPTY_RESPONSE_RE = /(?:EMPTY_RESPONSE|returned a completed response with no content)/i
+
+export function arenaChannelKey(selection) {
+  return String(selection?.provider || 'default')
+}
+
+export function normalizeArenaRequestLimit(value) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 10_000 ? parsed : DEFAULT_CHANNEL_REQUEST_LIMIT
+}
+
+export function normalizeArenaCooldownStatuses(value) {
+  if (!Array.isArray(value)) return [...DEFAULT_COOLDOWN_ERROR_STATUSES]
+  return [...new Set(value.map(Number).filter(status => Number.isInteger(status) && status >= 100 && status <= 599))].slice(0, 20)
+}
+
+function arenaFailureStatus(value) {
+  const failure = value?.failure && typeof value.failure === 'object' ? value.failure : value
+  const description = `${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`
+  const explicit = Number(failure?.status ?? failure?.statusCode ?? failure?.status_code)
+  if (Number.isInteger(explicit) && explicit >= 100 && explicit <= 599) return explicit
+  const embedded = description.match(/(?:^|\D)([1-5]\d{2})(?=\D|$)/)
+  if (embedded) return Number(embedded[1])
+  if (RATE_LIMIT_RE.test(description)) return 429
+  // 部分中转服务先收到真实 429，重试所有渠道后却向 DSH 包装成
+  // 500/get_channel_failed；无法取得显式状态码时按 500 处理。
+  if (RETRY_CHANNEL_EXHAUSTED_RE.test(description)) return 500
+  return 0
+}
+
+export function isArenaRateLimitFailure(value, configuredStatuses = DEFAULT_COOLDOWN_ERROR_STATUSES) {
+  return normalizeArenaCooldownStatuses(configuredStatuses).includes(arenaFailureStatus(value))
+}
+
+export function isArenaEmptyResponseFailure(value) {
+  const failure = value?.failure && typeof value.failure === 'object' ? value.failure : value
+  return EMPTY_RESPONSE_RE.test(`${String(failure?.code || '')} ${String(failure?.message || safeError(value))}`)
+}
 
 function createArenaUserMessage(text) {
   return Object.freeze({
@@ -94,14 +150,14 @@ async function readJsonBody(req) {
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     size += buffer.length
-    if (size > 256 * 1024) throw new HttpError(413, '请求体不能超过 256 KB')
+    if (size > 256 * 1024) throw new HttpError(413, uiMessage("readjsonbody.the.request.body.must.not.exceed.256.kb"))
     chunks.push(buffer)
   }
   if (!chunks.length) return {}
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'))
   } catch {
-    throw new HttpError(400, '请求体不是有效的 JSON')
+    throw new HttpError(400, uiMessage("readjsonbody.the.request.body.is.not.valid.json"))
   }
 }
 
@@ -116,6 +172,21 @@ function transcriptText(items, emptyText = '（还没有消息）') {
     .map(item => `${item.speaker ?? item.senderName}: ${item.text}`)
     .join('\n\n')
   return text.length > 24_000 ? text.slice(-24_000) : (text || emptyText)
+}
+
+function meetingContextText(meeting, profileId = null, afterMessageId = null) {
+  ensureMeetingWorkspace(meeting)
+  const visible = (meeting.transcript ?? []).filter(item => item.kind !== 'system')
+  const state = getMeetingContextState(meeting, profileId)
+  const index = state.compressedThroughId
+    ? visible.findIndex(item => item.id === state.compressedThroughId)
+    : -1
+  const deliveredIndex = afterMessageId ? visible.findIndex(item => item.id === afterMessageId) : -1
+  const recent = deliveredIndex >= 0 ? visible.slice(deliveredIndex + 1) : index >= 0 ? visible.slice(index + 1) : visible
+  return [
+    deliveredIndex < 0 && index >= 0 && state.summary ? `较早讨论的压缩摘要（原记录仍可在聊天区查看）：\n${state.summary}` : '',
+    `最近消息：\n${transcriptText(recent)}`,
+  ].filter(Boolean).join('\n\n')
 }
 
 function meetingWorkspaceText(meeting) {
@@ -133,7 +204,8 @@ function meetingWorkspaceText(meeting) {
   return [`当前协作阶段：${meeting.collaborationStage}`, '任务板：', tasks, '决策板：', decisions, '成果板：', artifacts].join('\n')
 }
 
-function participantPrompt(meeting, participant, coordinationText = '') {
+function participantPrompt(meeting, participant, coordinationText = '', afterMessageId = null) {
+  const assignedTask = meeting.tasks?.find(item => item.id === meeting.run?.currentTaskId && item.assigneeId === participant.id)
   return [
     `你正在“${meeting.topic}”协作群中，显示名称是 ${participant.name}。`,
     `你的人格与职责：${participant.role || '独立思考，主动推进问题并给出有依据的建议。'}`,
@@ -143,13 +215,14 @@ function participantPrompt(meeting, participant, coordinationText = '') {
     '公开发言时使用 arena_send_message。发一条还是多条、每条多长，都由你结合人格、语义和任务自然决定：能一条说清就发一条，需要自然分步、报告真实进度或补交最终结果时可以连续发送。绝对不要按字数、句号或固定模板机械切分。',
     '每次 arena_send_message 调用都会立刻显示在群聊中；调用过后不要在最终回答中重复这些公开内容。不要添加自己的姓名前缀，插件不限制输出 token。',
     '会议右侧有共享协作控制台。需要拆分或认领工作时更新任务板；出现多个可选方案时创建决策并留下理由、风险和信心；产出文件、链接或结论后登记到成果板。不要把这些结构化更新只写在聊天气泡里。',
+    assignedTask ? `当前由人类启动的任务：${assignedTask.title}。${assignedTask.description || ''} 请执行可行步骤、及时汇报真实进展，并更新任务状态；受阻时明确说明。` : '',
     coordinationText,
     '',
     '当前协作控制台：',
     meetingWorkspaceText(meeting),
     '',
     '当前群聊记录：',
-    transcriptText(meeting.transcript),
+    meetingContextText(meeting, participant.id, afterMessageId),
   ].join('\n')
 }
 
@@ -261,8 +334,9 @@ export function apply(ctx, config = {}) {
     settings: {
       rateLimitCooldownEnabled: false,
       channelQueueEnabled: false,
+      channelRequestsPerMinute: DEFAULT_CHANNEL_REQUEST_LIMIT,
+      cooldownErrorStatuses: [...DEFAULT_COOLDOWN_ERROR_STATUSES],
       autoReplyEnabled: true,
-      autoReplyDecisionMode: 'individual',
     },
     administrator: {
       id: 'administrator',
@@ -271,6 +345,7 @@ export function apply(ctx, config = {}) {
       role: '维护协作秩序，并按人类用户的要求安全地调整话题、协作阶段与决策状态。',
       provider: '',
       model: '',
+      compressionMode: 'dsh',
     },
     aiUsers: [],
   }
@@ -280,6 +355,10 @@ export function apply(ctx, config = {}) {
   const roomRuntimes = new Map()
   const channelQueues = new Map()
   const channelCooldowns = new Map()
+  const channelRequestTimes = new Map()
+  const arenaSessionIds = new Set()
+  const arenaSessionContexts = new Map()
+  const pendingApprovals = new Map()
   let activeCount = 0
   let disposed = false
   let persistChain = Promise.resolve()
@@ -305,10 +384,28 @@ export function apply(ctx, config = {}) {
         model: profile.model || '',
         status: current?.status || (muted.has(profile.id) ? 'muted' : 'idle'),
         stage: current?.stage || (muted.has(profile.id) ? '已静默' : '等待任务'),
+        stageI18n: current?.stageI18n,
+        detailI18n: current?.detailI18n,
+        currentToolI18n: current?.currentToolI18n,
         detail: current?.detail || '',
         currentTool: current?.currentTool || '',
+        stats: {
+          requests: Number(current?.stats?.requests) || 0,
+          inputTokens: Number(current?.stats?.inputTokens) || 0,
+          outputTokens: Number(current?.stats?.outputTokens) || 0,
+          failures: Number(current?.stats?.failures) || 0,
+          retries: Number(current?.stats?.retries) || 0,
+          intentChecks: Number(current?.stats?.intentChecks) || 0,
+          lastInputTokens: Number(current?.stats?.lastInputTokens) || 0,
+          lastDurationMs: Number(current?.stats?.lastDurationMs) || 0,
+        },
         claimedFiles: Array.isArray(current?.claimedFiles) ? current.claimedFiles.slice(0, 20) : [],
-        recent: Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
+        history: Array.isArray(current?.history)
+          ? current.history.slice(-2000)
+          : Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
+        recent: Array.isArray(current?.history)
+          ? current.history.slice(-10)
+          : Array.isArray(current?.recent) ? current.recent.slice(-10) : [],
         updatedAt: current?.updatedAt || nowIso(),
       }
     })
@@ -336,14 +433,14 @@ export function apply(ctx, config = {}) {
   function workspaceAssignee(meeting, value, allowEmpty = true) {
     const id = workspaceText(value, 80)
     if (!id && allowEmpty) return null
-    if (!meeting.participants.some(item => item.id === id) && id !== 'administrator') throw new HttpError(400, '负责人不在本场会议中')
+    if (!meeting.participants.some(item => item.id === id) && id !== 'administrator') throw new HttpError(400, uiMessage("workspaceassignee.the.assignee.is.not.a.member.of.this.meeting"))
     return id
   }
 
   function createWorkspaceTask(meeting, raw, createdBy = 'human') {
     ensureMeetingWorkspace(meeting)
     const title = workspaceText(raw?.title, 160)
-    if (!title) throw new HttpError(400, '任务标题不能为空')
+    if (!title) throw new HttpError(400, uiMessage("createworkspacetask.the.task.title.cannot.be.empty"))
     const timestamp = nowIso()
     const task = {
       id: randomUUID(), title, description: workspaceText(raw?.description, 1600),
@@ -358,17 +455,17 @@ export function apply(ctx, config = {}) {
   function updateWorkspaceTask(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const task = meeting.tasks.find(item => item.id === String(raw?.taskId ?? ''))
-    if (!task) throw new HttpError(404, '没有找到这个任务')
+    if (!task) throw new HttpError(404, uiMessage("updateworkspacetask.this.task.was.not.found"))
     if (Object.hasOwn(raw ?? {}, 'title')) {
       const title = workspaceText(raw.title, 160)
-      if (!title) throw new HttpError(400, '任务标题不能为空')
+      if (!title) throw new HttpError(400, uiMessage("createworkspacetask.the.task.title.cannot.be.empty"))
       task.title = title
     }
     if (Object.hasOwn(raw ?? {}, 'description')) task.description = workspaceText(raw.description, 1600)
     if (Object.hasOwn(raw ?? {}, 'assigneeId')) task.assigneeId = workspaceAssignee(meeting, raw.assigneeId)
     if (Object.hasOwn(raw ?? {}, 'status')) {
       const status = String(raw.status ?? '')
-      if (!TASK_STATUSES.includes(status)) throw new HttpError(400, '任务状态无效')
+      if (!TASK_STATUSES.includes(status)) throw new HttpError(400, uiMessage("updateworkspacetask.invalid.task.status"))
       task.status = status
       if (status === 'in-progress') meeting.collaborationStage = 'execution'
       else if (status === 'review') meeting.collaborationStage = 'review'
@@ -380,7 +477,7 @@ export function apply(ctx, config = {}) {
   function deleteWorkspaceTask(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const index = meeting.tasks.findIndex(item => item.id === String(raw?.taskId ?? ''))
-    if (index < 0) throw new HttpError(404, '没有找到这个任务')
+    if (index < 0) throw new HttpError(404, uiMessage("updateworkspacetask.this.task.was.not.found"))
     return meeting.tasks.splice(index, 1)[0]
   }
 
@@ -391,14 +488,14 @@ export function apply(ctx, config = {}) {
       const description = workspaceText(typeof value === 'object' ? value?.description : '', 1000)
       return label ? { id: randomUUID(), label, description, opinions: [] } : null
     }).filter(Boolean).slice(0, 6)
-    if (options.length < 2) throw new HttpError(400, '决策至少需要两个有效选项')
+    if (options.length < 2) throw new HttpError(400, uiMessage("normalizedecisionoptions.a.decision.requires.at.least.two.valid.options"))
     return options
   }
 
   function createWorkspaceDecision(meeting, raw, createdBy = 'human') {
     ensureMeetingWorkspace(meeting)
     const title = workspaceText(raw?.title, 160)
-    if (!title) throw new HttpError(400, '决策标题不能为空')
+    if (!title) throw new HttpError(400, uiMessage("createworkspacedecision.the.decision.title.cannot.be.empty"))
     const timestamp = nowIso()
     const decision = {
       id: randomUUID(), title, description: workspaceText(raw?.description, 1600),
@@ -413,9 +510,9 @@ export function apply(ctx, config = {}) {
   function addDecisionOpinion(meeting, raw, profile) {
     ensureMeetingWorkspace(meeting)
     const decision = meeting.decisions.find(item => item.id === String(raw?.decisionId ?? ''))
-    if (!decision) throw new HttpError(404, '没有找到这个决策')
+    if (!decision) throw new HttpError(404, uiMessage("adddecisionopinion.this.decision.was.not.found"))
     const option = decision.options.find(item => item.id === String(raw?.optionId ?? ''))
-    if (!option) throw new HttpError(404, '没有找到这个决策选项')
+    if (!option) throw new HttpError(404, uiMessage("adddecisionopinion.this.decision.option.was.not.found"))
     const stance = ['support', 'oppose', 'neutral'].includes(String(raw?.stance)) ? String(raw.stance) : 'neutral'
     const confidence = Math.max(0, Math.min(100, Number(raw?.confidence) || 0))
     const opinion = {
@@ -434,9 +531,9 @@ export function apply(ctx, config = {}) {
   function chooseWorkspaceDecision(meeting, raw, selectedBy = 'human') {
     ensureMeetingWorkspace(meeting)
     const decision = meeting.decisions.find(item => item.id === String(raw?.decisionId ?? ''))
-    if (!decision) throw new HttpError(404, '没有找到这个决策')
+    if (!decision) throw new HttpError(404, uiMessage("adddecisionopinion.this.decision.was.not.found"))
     const optionId = String(raw?.optionId ?? '')
-    if (!decision.options.some(item => item.id === optionId)) throw new HttpError(400, '决策选项无效')
+    if (!decision.options.some(item => item.id === optionId)) throw new HttpError(400, uiMessage("chooseworkspacedecision.invalid.decision.option"))
     decision.selectedOptionId = optionId
     decision.selectedBy = selectedBy
     decision.status = 'decided'
@@ -448,7 +545,7 @@ export function apply(ctx, config = {}) {
   function reopenWorkspaceDecision(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const decision = meeting.decisions.find(item => item.id === String(raw?.decisionId ?? ''))
-    if (!decision) throw new HttpError(404, '没有找到这个决策')
+    if (!decision) throw new HttpError(404, uiMessage("adddecisionopinion.this.decision.was.not.found"))
     decision.selectedOptionId = null
     decision.selectedBy = null
     decision.status = 'open'
@@ -460,14 +557,14 @@ export function apply(ctx, config = {}) {
   function deleteWorkspaceDecision(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const index = meeting.decisions.findIndex(item => item.id === String(raw?.decisionId ?? ''))
-    if (index < 0) throw new HttpError(404, '没有找到这个决策')
+    if (index < 0) throw new HttpError(404, uiMessage("adddecisionopinion.this.decision.was.not.found"))
     return meeting.decisions.splice(index, 1)[0]
   }
 
   function createWorkspaceArtifact(meeting, raw, createdBy = 'human') {
     ensureMeetingWorkspace(meeting)
     const title = workspaceText(raw?.title, 160)
-    if (!title) throw new HttpError(400, '成果标题不能为空')
+    if (!title) throw new HttpError(400, uiMessage("createworkspaceartifact.the.deliverable.title.cannot.be.empty"))
     const artifactType = ['file', 'link', 'note', 'summary'].includes(String(raw?.artifactType)) ? String(raw.artifactType) : 'note'
     const timestamp = nowIso()
     const artifact = {
@@ -483,10 +580,10 @@ export function apply(ctx, config = {}) {
   function updateWorkspaceArtifact(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const artifact = meeting.artifacts.find(item => item.id === String(raw?.artifactId ?? ''))
-    if (!artifact) throw new HttpError(404, '没有找到这个成果')
+    if (!artifact) throw new HttpError(404, uiMessage("updateworkspaceartifact.this.deliverable.was.not.found"))
     if (Object.hasOwn(raw ?? {}, 'status')) {
       const status = String(raw.status ?? '')
-      if (!['draft', 'accepted', 'rejected'].includes(status)) throw new HttpError(400, '成果状态无效')
+      if (!['draft', 'accepted', 'rejected'].includes(status)) throw new HttpError(400, uiMessage("updateworkspaceartifact.invalid.deliverable.status"))
       artifact.status = status
     }
     if (Object.hasOwn(raw ?? {}, 'title')) artifact.title = workspaceText(raw.title, 160) || artifact.title
@@ -499,7 +596,7 @@ export function apply(ctx, config = {}) {
   function deleteWorkspaceArtifact(meeting, raw) {
     ensureMeetingWorkspace(meeting)
     const index = meeting.artifacts.findIndex(item => item.id === String(raw?.artifactId ?? ''))
-    if (index < 0) throw new HttpError(404, '没有找到这个成果')
+    if (index < 0) throw new HttpError(404, uiMessage("updateworkspaceartifact.this.deliverable.was.not.found"))
     return meeting.artifacts.splice(index, 1)[0]
   }
 
@@ -509,7 +606,8 @@ export function apply(ctx, config = {}) {
     if (!role) {
       role = {
         profileId: profile.id, name: profile.name, avatar: profile.avatar, model: profile.model || '',
-        status: 'idle', stage: '等待任务', detail: '', currentTool: '', claimedFiles: [], recent: [], updatedAt: nowIso(),
+        status: 'idle', stage: '等待任务', detail: '', currentTool: '', claimedFiles: [], history: [], recent: [], updatedAt: nowIso(),
+        stats: { requests: 0, inputTokens: 0, outputTokens: 0, failures: 0, retries: 0, intentChecks: 0, lastInputTokens: 0, lastDurationMs: 0 },
       }
       monitor.roles.push(role)
     }
@@ -520,28 +618,50 @@ export function apply(ctx, config = {}) {
     if (!container || !profile?.id) return
     const role = roleActivity(container, profile)
     const timestamp = eventTime ? new Date(eventTime).toISOString() : nowIso()
-    Object.assign(role, patch, {
+    const localizedPatch = { ...patch }
+    for (const field of ['stage', 'detail', 'currentTool']) {
+      if (!Object.hasOwn(patch, field)) continue
+      localizedPatch[field] = uiText(patch[field])
+      localizedPatch[`${field}I18n`] = messageDescriptor(patch[field]) ?? null
+    }
+    Object.assign(role, localizedPatch, {
       name: profile.name,
       avatar: profile.avatar,
       model: profile.model || role.model || '',
       updatedAt: timestamp,
     })
     if (eventText) {
-      const text = String(eventText).trim().slice(0, 320)
-      const last = role.recent.at(-1)
+      const text = uiText(eventText).trim().slice(0, 320)
+      const last = role.history.at(-1) || role.recent.at(-1)
       if (!last || last.text !== text || last.kind !== eventKind) {
-        role.recent.push({ id: randomUUID(), kind: eventKind, text, createdAt: timestamp })
-        role.recent = role.recent.slice(-10)
+        role.history ??= []
+        role.history.push({ id: randomUUID(), kind: eventKind, text, i18n: messageDescriptor(eventText) ?? null, createdAt: timestamp })
+        role.history = role.history.slice(-2000)
+        role.recent = role.history.slice(-10)
       }
     }
     container.activityMonitor.updatedAt = timestamp
   }
 
-  function normalizeCoordinationFile(value) {
-    const text = String(value ?? '').trim()
-    if (!text || text.length > 1000) return null
-    const absolute = resolve(process.cwd(), text)
-    return { key: process.platform === 'win32' ? absolute.toLocaleLowerCase() : absolute, path: absolute }
+  function updateRun(meeting, status, phase = status, taskId = meeting.run?.currentTaskId || null) {
+    ensureMeetingWorkspace(meeting)
+    meeting.run = {
+      ...meeting.run,
+      id: meeting.run.id || randomUUID(),
+      status, phase, currentTaskId: taskId,
+      startedAt: meeting.run.startedAt || nowIso(), updatedAt: nowIso(),
+    }
+  }
+
+  function recordRequest(context, patch) {
+    if (!context?.container || !context?.profile) return
+    const role = roleActivity(context.container, context.profile)
+    for (const [key, amount] of Object.entries(patch)) {
+      role.stats[key] = Math.max(0, (role.stats[key] || 0) + amount)
+    }
+    role.updatedAt = nowIso()
+    context.container.activityMonitor.updatedAt = role.updatedAt
+    void persist().catch(() => undefined)
   }
 
   function coordinationBoard(runtime, selfId) {
@@ -560,7 +680,7 @@ export function apply(ctx, config = {}) {
 
   function releaseRoleClaims(runtime, profileId, requestedFiles = []) {
     runtime.fileClaims ??= new Map()
-    const requested = requestedFiles.map(normalizeCoordinationFile).filter(Boolean)
+    const requested = requestedFiles.map(file => normalizeCoordinationFile(file, runtime.workdir)).filter(Boolean)
     const keys = requested.length ? new Set(requested.map(item => item.key)) : null
     for (const [key, claim] of runtime.fileClaims) {
       if (claim.ownerId === profileId && (!keys || keys.has(key))) runtime.fileClaims.delete(key)
@@ -574,7 +694,7 @@ export function apply(ctx, config = {}) {
 
   function claimRoleFiles(runtime, profile, requestedFiles) {
     runtime.fileClaims ??= new Map()
-    const files = [...new Map(requestedFiles.map(normalizeCoordinationFile).filter(Boolean).map(item => [item.key, item])).values()].slice(0, 20)
+    const files = [...new Map(requestedFiles.map(file => normalizeCoordinationFile(file, runtime.workdir)).filter(Boolean).map(item => [item.key, item])).values()].slice(0, 20)
     const conflicts = files.flatMap(file => {
       const claim = runtime.fileClaims.get(file.key)
       if (!claim || claim.ownerId === profile.id) return []
@@ -583,7 +703,7 @@ export function apply(ctx, config = {}) {
     if (conflicts.length) return { ok: false, files, conflicts }
     for (const file of files) runtime.fileClaims.set(file.key, { ownerId: profile.id, ownerName: profile.name, path: file.path })
     const claimedFiles = [...runtime.fileClaims.values()].filter(claim => claim.ownerId === profile.id).map(claim => claim.path)
-    setRoleActivity(runtime.container, profile, { status: 'editing', stage: '已锁定文件，准备编辑', claimedFiles }, files.length ? `锁定 ${files.length} 个文件` : '')
+    setRoleActivity(runtime.container, profile, { status: 'editing', stage: uiMessage("claimrolefiles.files.locked.preparing.to.edit"), claimedFiles }, files.length ? uiMessage("claimrolefiles.locked.value.files", { p0: files.length }) : '')
     return { ok: true, files, conflicts: [] }
   }
 
@@ -662,7 +782,7 @@ export function apply(ctx, config = {}) {
         let message = '已返回实时协作板。'
         let conflicts = []
         if (action === 'update') {
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: summary || '正在推进任务', detail: summary }, summary || '更新了工作状态')
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: summary || uiMessage("coordinationtool.working.on.the.task"), detail: summary }, summary || uiMessage("coordinationtool.updated.work.status"))
           message = '工作状态已更新。'
         } else if (action === 'claim') {
           const result = claimRoleFiles(runtime, profile, files)
@@ -673,20 +793,20 @@ export function apply(ctx, config = {}) {
             message = files.length ? '文件已锁定；完成编辑后请 release。' : '没有提供可锁定的文件。'
           } else {
             const owners = [...new Set(conflicts.map(item => item.ownerName))].join('、')
-            setRoleActivity(runtime.container, profile, { status: 'waiting', stage: '等待文件锁', detail: `${owners} 正在编辑冲突文件` }, `检测到文件冲突：${owners}`, 'warning')
+            setRoleActivity(runtime.container, profile, { status: 'waiting', stage: uiMessage("coordinationtool.waiting.for.file.locks"), detail: uiMessage("coordinationtool.value.is.editing.conflicting.files", { p0: owners }) }, uiMessage("coordinationtool.file.conflict.detected.value", { p0: owners }), 'warning')
             message = `锁定失败：${owners} 正在编辑这些文件。不要修改冲突文件；请等待、换任务或与对方协调。`
           }
         } else if (action === 'release') {
           releaseRoleClaims(runtime, profile.id, files)
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: summary || '已释放文件锁', detail: summary }, '释放了文件锁')
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: summary || uiMessage("coordinationtool.file.locks.released"), detail: summary }, uiMessage("coordinationtool.released.file.locks"))
           message = '文件锁已释放。'
         } else if (action === 'task-create' && runtime.isMeeting) {
           const task = createWorkspaceTask(runtime.container, raw, profile.id)
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: `已创建任务：${task.title}`, detail: task.description }, `创建任务：${task.title}`)
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: uiMessage("coordinationtool.task.created.value", { p0: task.title }), detail: task.description }, uiMessage("coordinationtool.created.task.value", { p0: task.title }))
           message = `任务已创建，ID：${task.id}`
         } else if (action === 'task-update' && runtime.isMeeting) {
           const task = updateWorkspaceTask(runtime.container, raw)
-          setRoleActivity(runtime.container, profile, { status: task.status === 'blocked' ? 'waiting' : 'working', stage: `任务“${task.title}”：${task.status}`, detail: task.description }, `更新任务：${task.title} → ${task.status}`, task.status === 'blocked' ? 'warning' : 'info')
+          setRoleActivity(runtime.container, profile, { status: task.status === 'blocked' ? 'waiting' : 'working', stage: uiMessage("coordinationtool.task.value.value", { p0: task.title, p1: task.status }), detail: task.description }, uiMessage("coordinationtool.updated.task.value.value", { p0: task.title, p1: task.status }), task.status === 'blocked' ? 'warning' : 'info')
           message = `任务已更新：${task.title}`
         } else if (action === 'decision-create' && runtime.isMeeting) {
           const decision = createWorkspaceDecision(runtime.container, raw, profile.id)
@@ -696,13 +816,13 @@ export function apply(ctx, config = {}) {
           message = '方案意见已记录，最终方案由人类用户选择。'
         } else if (action === 'artifact-add' && runtime.isMeeting) {
           const artifact = createWorkspaceArtifact(runtime.container, { ...raw, ownerId: profile.id }, profile.id)
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: `已登记成果：${artifact.title}`, detail: artifact.location || artifact.description }, `登记成果：${artifact.title}`, 'success')
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: uiMessage("coordinationtool.deliverable.registered.value", { p0: artifact.title }), detail: artifact.location || artifact.description }, uiMessage("coordinationtool.registered.deliverable.value", { p0: artifact.title }), 'success')
           message = `成果已登记，ID：${artifact.id}`
         } else if (!['view', 'update', 'claim', 'release'].includes(action)) {
           ok = false
           message = runtime.isMeeting ? '协作控制台操作参数无效。' : '任务、决策和成果只在协作会议中可用。'
         } else {
-          setRoleActivity(runtime.container, profile, { stage: summary || '查看协作动态', detail: summary })
+          setRoleActivity(runtime.container, profile, { stage: summary || uiMessage("coordinationtool.viewing.collaboration.activity"), detail: summary })
         }
         return {
           ok, message, conflicts, roles: coordinationBoard(runtime, profile.id),
@@ -754,8 +874,8 @@ export function apply(ctx, config = {}) {
         turn.sentTexts.push(text)
         turn.messageIds.push(message.id)
         setRoleActivity(runtime.container, profile, {
-          status: 'working', stage: '已发送一条消息，仍在继续处理', detail: text.slice(0, 180), currentTool: '',
-        }, '自主发送了一条公开消息', 'message')
+          status: 'working', stage: uiMessage("autonomousmessagetool.sent.a.message.continuing.work"), detail: text.slice(0, 180), currentTool: '',
+        }, uiMessage("autonomousmessagetool.sent.a.public.message"), 'message')
         await persist()
         return {
           ok: true,
@@ -770,14 +890,18 @@ export function apply(ctx, config = {}) {
     agentCtx.tools.register(coordinationTool(runtime, profile))
     agentCtx.tools.register(autonomousMessageTool(runtime, profile))
     agentCtx.tools.guard(exec => {
-      const files = mutationTargets(exec.name, exec.arguments).map(normalizeCoordinationFile).filter(Boolean)
+      const category = capabilityCategory(exec.name)
+      if (category && !capabilityFor(runtime.container, profile.id)[category]) {
+        return `Agent Arena: ${profile.name} 的 ${category} 能力已被此对话关闭。请请求人类在角色能力设置中开启。`
+      }
+      const files = mutationTargets(exec.name, exec.arguments).map(file => normalizeCoordinationFile(file, runtime.workdir)).filter(Boolean)
       if (!files.length) return undefined
       runtime.fileClaims ??= new Map()
       for (const file of files) {
         const claim = runtime.fileClaims.get(file.key)
         if (claim?.ownerId === profile.id) continue
         if (claim) {
-          setRoleActivity(runtime.container, profile, { status: 'waiting', stage: '检测到编辑冲突', detail: `${claim.ownerName} 正在编辑 ${file.path}` }, `阻止了冲突编辑：${file.path}`, 'warning')
+          setRoleActivity(runtime.container, profile, { status: 'waiting', stage: uiMessage("installcoordinationplane.editing.conflict.detected"), detail: uiMessage("installcoordinationplane.value.is.editing.value", { p0: claim.ownerName, p1: file.path }) }, uiMessage("installcoordinationplane.blocked.a.conflicting.edit.value", { p0: file.path }), 'warning')
           return `Agent Arena 已阻止编辑冲突：${claim.ownerName} 正在编辑 ${file.path}。请通过 arena_coordination 查看协作板并等待或改做其他任务。`
         }
         return `为避免多角色编辑冲突，请先调用 arena_coordination，action=claim，files 包含 ${file.path}；锁定成功后再编辑。`
@@ -871,11 +995,12 @@ export function apply(ctx, config = {}) {
         ...profiles.settings,
         rateLimitCooldownEnabled: stored.profiles.settings.rateLimitCooldownEnabled === true,
         channelQueueEnabled: stored.profiles.settings.channelQueueEnabled === true,
+        channelRequestsPerMinute: normalizeArenaRequestLimit(stored.profiles.settings.channelRequestsPerMinute),
+        cooldownErrorStatuses: normalizeArenaCooldownStatuses(stored.profiles.settings.cooldownErrorStatuses),
         autoReplyEnabled: stored.profiles.settings.autoReplyEnabled !== false,
-        autoReplyDecisionMode: stored.profiles.settings.autoReplyDecisionMode === 'admin' ? 'admin' : 'individual',
       }
-      if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator' }
-      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model).map(item => ({ ...item, autoReplyDisabled: item.autoReplyDisabled === true }))
+      if (stored?.profiles?.administrator) profiles.administrator = { ...profiles.administrator, ...stored.profiles.administrator, id: 'administrator', compressionMode: normalizeCompressionMode(stored.profiles.administrator.compressionMode) }
+      if (Array.isArray(stored?.profiles?.aiUsers)) profiles.aiUsers = stored.profiles.aiUsers.filter(item => item?.id && item?.name && item?.provider && item?.model).map(item => ({ ...item, compressionMode: normalizeCompressionMode(item.compressionMode), autoReplyDisabled: item.autoReplyDisabled === true, capabilities: normalizeCapabilities(item.capabilities) }))
       for (const room of Array.isArray(stored?.rooms) ? stored.rooms : []) {
         if (!room?.id) continue
         if (room.type === 'group' && !room.administratorProfile) {
@@ -891,12 +1016,22 @@ export function apply(ctx, config = {}) {
           room.messages.push({ id: randomUUID(), kind: 'system', senderId: 'system', senderName: '系统', avatar: 'ℹ️', text: 'DSH 重启中断了上次回复，请重新发送消息。', createdAt: nowIso() })
         }
         room.mutedParticipantIds = Array.isArray(room.mutedParticipantIds) ? room.mutedParticipantIds : []
+        room.permissions = room.permissions && typeof room.permissions === 'object' ? room.permissions : {}
+        room.capabilities = room.capabilities && typeof room.capabilities === 'object' ? room.capabilities : {}
+        room.workdir = typeof room.workdir === 'string' ? room.workdir.trim() : ''
+        for (const participant of permissionProfiles(room)) {
+          room.permissions[participant.id] = normalizePermissionMode(room.permissions[participant.id])
+          room.capabilities[participant.id] = normalizeCapabilities(room.capabilities[participant.id] ?? participant.capabilities)
+        }
+        for (const message of room.messages ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         room.respondingProfileIds = Array.isArray(room.respondingProfileIds) ? room.respondingProfileIds : []
         const roomMonitor = ensureActivityMonitor(room)
         for (const role of roomMonitor.roles) {
           role.status = room.mutedParticipantIds.includes(role.profileId) ? 'muted' : 'idle'
           role.stage = role.status === 'muted' ? '已静默' : '等待任务'
+          role.stageI18n = messageDescriptor(uiMessage(role.status === 'muted' ? 'role_activity.muted' : 'roleactivity.waiting.for.a.task'))
           role.currentTool = ''
+          role.currentToolI18n = null
           role.claimedFiles = []
         }
         rooms.set(room.id, room)
@@ -905,6 +1040,14 @@ export function apply(ctx, config = {}) {
         if (!meeting?.id) continue
         if (!Array.isArray(meeting.tasks) || !Array.isArray(meeting.decisions) || !Array.isArray(meeting.artifacts) || !MEETING_STAGES.includes(meeting.collaborationStage)) recovered = true
         ensureMeetingWorkspace(meeting)
+        meeting.administratorProfile.compressionMode = normalizeCompressionMode(meeting.administratorProfile.compressionMode ?? profiles.administrator.compressionMode)
+        for (const participant of meeting.participants ?? []) participant.compressionMode = normalizeCompressionMode(participant.compressionMode ?? profiles.aiUsers.find(item => item.id === participant.id)?.compressionMode)
+        if (['running', 'queued'].includes(meeting.run.status)) {
+          meeting.run.status = 'paused'
+          meeting.run.phase = 'interrupted'
+          meeting.run.updatedAt = nowIso()
+          recovered = true
+        }
         if (BUSY_MEETING_STATUSES.has(meeting.status) || LEGACY_TERMINAL_STATUSES.has(meeting.status)) {
           recovered = true
           meeting.status = 'paused'
@@ -914,11 +1057,21 @@ export function apply(ctx, config = {}) {
           meeting.participants = (meeting.participants ?? []).map(item => ({ ...item, status: 'idle' }))
         }
         meeting.mutedParticipantIds = Array.isArray(meeting.mutedParticipantIds) ? meeting.mutedParticipantIds : []
+        meeting.permissions = meeting.permissions && typeof meeting.permissions === 'object' ? meeting.permissions : {}
+        meeting.capabilities = meeting.capabilities && typeof meeting.capabilities === 'object' ? meeting.capabilities : {}
+        meeting.workdir = typeof meeting.workdir === 'string' ? meeting.workdir.trim() : ''
+        for (const participant of permissionProfiles(meeting)) {
+          meeting.permissions[participant.id] = normalizePermissionMode(meeting.permissions[participant.id])
+          meeting.capabilities[participant.id] = normalizeCapabilities(meeting.capabilities[participant.id] ?? participant.capabilities)
+        }
+        for (const message of meeting.transcript ?? []) if (message.approval?.status === 'pending') message.approval.status = 'cancelled'
         const meetingMonitor = ensureActivityMonitor(meeting)
         for (const role of meetingMonitor.roles) {
           role.status = meeting.mutedParticipantIds.includes(role.profileId) ? 'muted' : 'idle'
           role.stage = role.status === 'muted' ? '已静默' : '等待任务'
+          role.stageI18n = messageDescriptor(uiMessage(role.status === 'muted' ? 'role_activity.muted' : 'roleactivity.waiting.for.a.task'))
           role.currentTool = ''
+          role.currentToolI18n = null
           role.claimedFiles = []
         }
         meetings.set(meeting.id, meeting)
@@ -942,24 +1095,24 @@ export function apply(ctx, config = {}) {
       if (provider.id === selection.provider && !models.some(model => model.id === selection.model)) {
         models.unshift({ provider: provider.id, id: selection.model, name: selection.model })
       }
-      return { id: provider.id, name: provider.name, models: models.map(model => ({ id: model.id, name: model.name, description: model.description })) }
+      return { id: provider.id, name: provider.name, models: models.map(model => ({ id: model.id, name: model.name, description: model.description, contextWindow: model.contextWindow })) }
     }))
     catalogCache = { expiresAt: Date.now() + 10_000, value }
     return value
   }
 
   function validateProfileBase(raw, fallbackAvatar) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '用户资料必须是 JSON 对象')
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, uiMessage("validateprofilebase.the.user.profile.must.be.a.json.object"))
     const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, 24) : ''
-    if (!name) throw new HttpError(400, '显示名称不能为空')
+    if (!name) throw new HttpError(400, uiMessage("validateprofilebase.the.display.name.cannot.be.empty"))
     return { name, avatar: cleanAvatar(raw.avatar, fallbackAvatar) }
   }
 
   function validateModel(raw) {
     const provider = typeof raw.provider === 'string' ? raw.provider.trim().slice(0, 100) : ''
     const model = typeof raw.model === 'string' ? raw.model.trim().slice(0, 160) : ''
-    if (!provider || !model) throw new HttpError(400, '请选择供应商和模型')
-    if (!ctx.llm.listProviders().some(item => item.id === provider)) throw new HttpError(400, '所选供应商当前未在 DSH 中启用')
+    if (!provider || !model) throw new HttpError(400, uiMessage("validatemodel.please.select.a.provider.and.model"))
+    if (!ctx.llm.listProviders().some(item => item.id === provider)) throw new HttpError(400, uiMessage("validatemodel.the.selected.provider.is.not.currently.enabled.in.dsh"))
     return { provider, model }
   }
 
@@ -972,10 +1125,12 @@ export function apply(ctx, config = {}) {
   async function saveAdministratorProfile(raw) {
     const base = validateProfileBase(raw, '🛡️')
     const model = validateModel(raw)
+    if (raw.compressionMode != null && !['dsh', 'server'].includes(raw.compressionMode)) throw new HttpError(400, uiMessage("users.choose.compression.mode"))
     profiles.administrator = {
       id: 'administrator',
       ...base,
       ...model,
+      compressionMode: normalizeCompressionMode(raw.compressionMode),
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       updatedAt: nowIso(),
     }
@@ -995,13 +1150,14 @@ export function apply(ctx, config = {}) {
   }
 
   async function saveSettings(raw) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '设置必须是 JSON 对象')
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, uiMessage("savesettings.settings.must.be.a.json.object"))
     profiles.settings = {
       ...profiles.settings,
       rateLimitCooldownEnabled: raw.rateLimitCooldownEnabled === true,
       channelQueueEnabled: raw.channelQueueEnabled === true,
+      channelRequestsPerMinute: normalizeArenaRequestLimit(raw.channelRequestsPerMinute),
+      cooldownErrorStatuses: normalizeArenaCooldownStatuses(raw.cooldownErrorStatuses),
       autoReplyEnabled: raw.autoReplyEnabled !== false,
-      autoReplyDecisionMode: raw.autoReplyDecisionMode === 'admin' ? 'admin' : 'individual',
     }
     await persist()
     return profiles.settings
@@ -1012,13 +1168,16 @@ export function apply(ctx, config = {}) {
     const model = validateModel(raw)
     const requestedId = typeof raw.id === 'string' ? raw.id.trim() : ''
     const existingIndex = profiles.aiUsers.findIndex(item => item.id === requestedId)
+    if ((existingIndex < 0 && !['dsh', 'server'].includes(raw.compressionMode)) || (raw.compressionMode != null && !['dsh', 'server'].includes(raw.compressionMode))) throw new HttpError(400, uiMessage("users.choose.compression.mode"))
     const profile = {
       id: existingIndex >= 0 ? requestedId : randomUUID(),
       ...base,
       ...model,
+      compressionMode: normalizeCompressionMode(raw.compressionMode ?? profiles.aiUsers[existingIndex]?.compressionMode),
       role: typeof raw.role === 'string' ? raw.role.trim().slice(0, 16_000) : '',
       presetPrompts: (Array.isArray(raw.presetPrompts) ? raw.presetPrompts : []).map(item => typeof item === 'string' ? item.trim().slice(0, 240) : '').filter(Boolean).slice(0, 8),
       autoReplyDisabled: raw.autoReplyDisabled === true,
+      capabilities: normalizeCapabilities(raw.capabilities),
       color: /^#[0-9a-f]{6}$/i.test(String(raw.color ?? '')) ? String(raw.color) : '#6f5ee8',
       updatedAt: nowIso(),
     }
@@ -1046,7 +1205,7 @@ export function apply(ctx, config = {}) {
 
   async function deleteAiProfile(id) {
     const index = profiles.aiUsers.findIndex(item => item.id === id)
-    if (index < 0) throw new HttpError(404, '没有找到这个 AI 用户')
+    if (index < 0) throw new HttpError(404, uiMessage("deleteaiprofile.this.ai.user.was.not.found"))
     profiles.aiUsers.splice(index, 1)
     await persist()
   }
@@ -1077,12 +1236,201 @@ export function apply(ctx, config = {}) {
     return modelSelection(latest)
   }
 
-  async function createParent(label, signal) {
+  function contextWindowFor(profile) {
+    const selection = liveModelSelection(profile)
+    const model = catalogCache.value.find(item => item.id === selection.provider)?.models.find(item => item.id === selection.model)
+    return Number(model?.contextWindow) || null
+  }
+
+  function contextProfilesFor(meeting) {
+    return [
+      { id: 'administrator', profile: meeting.administratorProfile },
+      ...(meeting.participants ?? []).map(profile => ({ id: profile.id, profile })),
+    ].filter(item => item.profile?.id)
+  }
+
+  function contextSnapshotFor(meeting) {
+    ensureMeetingWorkspace(meeting)
+    const runtime = runtimes.get(meeting.id)
+    return contextProfilesFor(meeting).map(({ id, profile }) => {
+      const state = getMeetingContextState(meeting, id)
+      const estimate = estimateMeetingContext(meeting, contextWindowFor(profile), id)
+      return {
+        profileId: id,
+        name: profile.name,
+        avatar: profile.avatar,
+        provider: profile.provider,
+        model: profile.model,
+        compressionMode: normalizeCompressionMode(profile.compressionMode),
+        active: Boolean(runtime?.roleAgents?.has(id)),
+        ...estimate,
+        summary: state.summary,
+        summaryUpdatedAt: state.summaryUpdatedAt,
+        compressionCount: state.compressionCount,
+      }
+    })
+  }
+
+  async function compactRoleSession(meeting, profileId, signal) {
+    const profile = contextProfilesFor(meeting).find(item => item.id === profileId)?.profile
+    if (!profile) throw new HttpError(400, uiMessage("actonmeeting.invalid.context.profile"))
+    if (normalizeCompressionMode(profile.compressionMode) === 'server') throw new HttpError(409, uiMessage("board.context.server.no.manual"))
+    const runtime = runtimes.get(meeting.id)
+    const pending = runtime?.roleAgents?.get(profileId)
+    if (!pending) throw new HttpError(409, uiMessage("board.context.no.active.session"))
+    const handle = await pending
+    // DSH 0.1.7 mounts compaction inside each Agent Preset, not on the web host.
+    const engine = handle.agent?.ctx?.get?.('compaction') ?? ctx.get('compaction')
+    if (!engine?.compactNow) throw new HttpError(503, uiMessage("board.context.native.unavailable"))
+    let result
+    try { result = await engine.compactNow(handle.agent, signal) }
+    catch (error) { throw new HttpError(409, safeError(error)) }
+    if (!result) throw new HttpError(409, uiMessage("actonmeeting.there.is.not.enough.context.to.compress"))
+    const state = meeting.contextByProfile[profileId]
+    state.summary = messageText(result.summary).slice(-6000)
+    state.summaryUpdatedAt = nowIso()
+    state.compressionCount += 1
+    meeting.contextCompressionCount += 1
+    runtime.lastNativeCompressionMessageCounts ??= new Map()
+    runtime.lastNativeCompressionMessageCounts.set(profileId, (meeting.transcript ?? []).filter(item => item.kind !== 'system').length)
+    const role = meeting.activityMonitor?.roles?.find(item => item.profileId === profileId)
+    if (role?.stats) role.stats.lastInputTokens = 0
+    return true
+  }
+
+  async function maybeAutoCompressMeeting(meeting, profile, runtime, handle) {
+    ensureMeetingWorkspace(meeting)
+    if (normalizeCompressionMode(profile?.compressionMode) === 'server') return false
+    if (!meeting.contextSettings.autoCompressEnabled) return false
+    const visibleCount = (meeting.transcript ?? []).filter(item => item.kind !== 'system').length
+    const lastCompressedAt = runtime.lastNativeCompressionMessageCounts?.get(profile.id)
+    if (lastCompressedAt !== undefined && visibleCount - lastCompressedAt < 12) return false
+    // Keep the fallback internal: the UI never presents it as model metadata.
+    const usage = estimateMeetingContext(meeting, contextWindowFor(profile) || 7_500, profile?.id)
+    if (usage.percent < meeting.contextSettings.autoCompressThreshold) return false
+    if (!runtime.roleContextDelivered?.has(profile.id)) return false
+    try { return await compactRoleSession(meeting, profile.id, runtime.abort.signal) }
+    catch (error) {
+      setRoleActivity(meeting, profile, { status: 'error', stage: uiMessage("board.context.native.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
+      return false
+    }
+  }
+
+  function normalizePermissionMode(value) {
+    const mode = String(value || '')
+    return AGENT_PERMISSION_MODES.includes(mode) ? mode : 'danger-full-access'
+  }
+
+  function permissionFor(container, profileId) {
+    return normalizePermissionMode(container?.permissions?.[profileId])
+  }
+
+  function capabilityFor(container, profileId) {
+    const profile = permissionProfiles(container).find(item => item.id === profileId)
+    return normalizeCapabilities(container?.capabilities?.[profileId] ?? profile?.capabilities)
+  }
+
+  function capabilityCategory(toolName) {
+    const name = String(toolName || '').toLowerCase()
+    if (name.startsWith('arena_')) return 'collaboration'
+    if (/subagent|spawn|delegate|workflow|create_thread/.test(name)) return 'subagents'
+    if (/mcp|skill/.test(name)) return 'skillsMcp'
+    if (/web|browser|fetch|http|url|search_engine/.test(name)) return 'network'
+    if (/exec|shell|bash|pwsh|terminal|command|run_code/.test(name)) return 'terminal'
+    if (/file|read|write|edit|patch|glob|grep|find|search|list/.test(name)) return 'files'
+    return null
+  }
+
+  function permissionProfiles(container) {
+    const items = [...(container?.participants ?? [])]
+    const administrator = container?.administratorProfile
+    if (administrator?.id && !items.some(item => item.id === administrator.id)) items.unshift(administrator)
+    return items
+  }
+
+  function permissionSpec(mode) {
+    const normalized = normalizePermissionMode(mode)
+    return {
+      mode: normalized,
+      label: AGENT_PERMISSION_LABELS[normalized],
+      sandbox: normalized,
+      approval: normalized === 'danger-full-access' ? 'never' : 'ask',
+    }
+  }
+
+  function applyAgentPermission(handle, mode) {
+    if (!handle?.agent?.session) return
+    const spec = permissionSpec(mode)
+    const session = handle.agent.session
+    try { session.append('sandbox/mode', { mode: spec.sandbox }) } catch { /* older DSH builds may not expose this event */ }
+    try { session.append('approval/policy', { policy: spec.approval }) } catch { /* best effort */ }
+    try { ctx.get('approval')?.setPolicy(handle.agent, spec.approval) } catch { /* best effort */ }
+  }
+
+  function containerForApproval(agent) {
+    return arenaSessionContexts.get(String(agent?.id || ''))
+  }
+
+  function approvalIdForRequest(req) {
+    const events = req?.agent?.session?.events || []
+    const decided = new Set()
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event.type === 'approval/decided') { decided.add(event.data.id); continue }
+      if (event.type !== 'approval/asked' || decided.has(event.data.id)) continue
+      if ((req.callId ?? null) !== (event.data.callId ?? null)) continue
+      if ([...pendingApprovals.values()].some(item => item.approvalId === event.data.id)) continue
+      return String(event.data.id)
+    }
+    return ''
+  }
+
+  function approvalMessage(container, approvalId, req, profile) {
+    const message = uiMessage('approvalmessage.please.review.value.s.operation.valuevalue', { p0: profile?.name || 'AI', p1: req.toolName, p2: req.reason ? `\n${req.reason}` : '' })
+    const text = uiText(message)
+    const base = {
+      id: randomUUID(), kind: container.type === 'meeting' ? 'system' : 'system',
+      senderId: 'system', senderName: '权限审计', avatar: '🛡️', text, i18n: messageDescriptor(message), createdAt: nowIso(),
+      approval: { id: approvalId, toolName: req.toolName, reason: req.reason || '', status: 'pending', options: ['allow-once', 'reject', 'manual'] },
+    }
+    if (Array.isArray(container.transcript)) container.transcript.push(base)
+    else if (Array.isArray(container.messages)) container.messages.push(base)
+    return base
+  }
+
+  function approvalContainerMessage(entry) {
+    return Array.isArray(entry.container?.transcript)
+      ? entry.container.transcript.find(item => item.approval?.id === entry.approvalId)
+      : entry.container?.messages?.find(item => item.approval?.id === entry.approvalId)
+  }
+
+  async function resolveArenaApproval(container, raw) {
+    const approvalId = String(raw?.approvalId || '')
+    const entry = pendingApprovals.get(approvalId)
+    if (!entry || entry.container !== container) throw new HttpError(404, uiMessage("resolvearenaapproval.no.pending.operation.was.found.for.review"))
+    const choice = String(raw?.outcome || '')
+    if (!['allowed-once', 'rejected'].includes(choice)) throw new HttpError(400, uiMessage("resolvearenaapproval.invalid.approval.result"))
+    const note = typeof raw?.note === 'string' ? raw.note.trim().slice(0, 2000) : ''
+    const message = approvalContainerMessage(entry)
+    if (message?.approval) Object.assign(message.approval, { status: choice === 'allowed-once' ? 'approved' : 'rejected', note })
+    if (note) {
+      const target = Array.isArray(container.transcript) ? container.transcript : container.messages
+      target.push({ id: randomUUID(), kind: 'human', senderId: 'human', senderName: profiles.human.name, avatar: profiles.human.avatar, text: `审计备注：${note}`, createdAt: nowIso() })
+    }
+    pendingApprovals.delete(approvalId)
+    entry.resolve(choice)
+    await persist()
+    return container
+  }
+
+  async function createParent(label, signal, cwd) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection()
+    const sessionId = randomUUID()
+    arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
-      sessionId: randomUUID(),
-      meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
+      sessionId,
+      meta: { cwd, ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal,
       async setup(agentCtx) {
@@ -1094,12 +1442,8 @@ export function apply(ctx, config = {}) {
     return archiveArenaAgent(handle)
   }
 
-  function channelKey(selection) {
-    return `${selection.provider || 'default'}:${selection.model || 'default'}`
-  }
-
   function cooldownInfo(selection) {
-    const key = channelKey(selection)
+    const key = arenaChannelKey(selection)
     const until = channelCooldowns.get(key) || 0
     if (until <= Date.now()) {
       channelCooldowns.delete(key)
@@ -1110,45 +1454,200 @@ export function apply(ctx, config = {}) {
 
   function markChannelFailure(selection, error) {
     if (!profiles.settings.rateLimitCooldownEnabled) return
-    if (RATE_LIMIT_RE.test(safeError(error))) channelCooldowns.set(channelKey(selection), Date.now() + COOLDOWN_MS)
+    if (!isArenaRateLimitFailure(error, profiles.settings.cooldownErrorStatuses)) return
+    const retryAfterMs = Number(error?.providerRetryAfterMs ?? error?.failure?.providerRetryAfterMs)
+    const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? Math.max(COOLDOWN_MS, retryAfterMs) : COOLDOWN_MS
+    channelCooldowns.set(arenaChannelKey(selection), Date.now() + delayMs)
   }
 
-  async function withChannelQueue(selection, task) {
-    if (!profiles.settings.channelQueueEnabled) return task()
-    const key = channelKey(selection)
-    const previous = channelQueues.get(key) || Promise.resolve()
-    const current = previous.catch(() => undefined).then(task)
-    channelQueues.set(key, current.finally(() => { if (channelQueues.get(key) === current) channelQueues.delete(key) }))
-    return current
+  function waitForChannel(ms, signal) {
+    if (!(ms > 0)) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(done, ms)
+      const abort = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
+        reject(signal?.reason instanceof Error ? signal.reason : new Error('任务已终止'))
+      }
+      function done() {
+        signal?.removeEventListener('abort', abort)
+        resolve()
+      }
+      if (signal?.aborted) abort()
+      else signal?.addEventListener('abort', abort, { once: true })
+    })
   }
+
+  async function waitForChannelCooldown(selection, signal) {
+    while (profiles.settings.rateLimitCooldownEnabled) {
+      const cooldown = cooldownInfo(selection)
+      if (!cooldown) return
+      await waitForChannel(cooldown.remainingMs, signal)
+    }
+  }
+
+  async function acquireChannel(selection, signal) {
+    if (!profiles.settings.channelQueueEnabled) return () => undefined
+    const key = arenaChannelKey(selection)
+    const previous = channelQueues.get(key) || Promise.resolve()
+    let unlock
+    const gate = new Promise(resolve => { unlock = resolve })
+    channelQueues.set(key, gate)
+    await previous.catch(() => undefined)
+    if (signal?.aborted) {
+      unlock()
+      if (channelQueues.get(key) === gate) channelQueues.delete(key)
+      throw signal.reason instanceof Error ? signal.reason : new Error('任务已终止')
+    }
+    return () => {
+      unlock()
+      if (channelQueues.get(key) === gate) channelQueues.delete(key)
+    }
+  }
+
+  async function reserveChannelRequest(selection, signal) {
+    if (!profiles.settings.channelQueueEnabled) return
+    const key = arenaChannelKey(selection)
+    while (true) {
+      const now = Date.now()
+      const recent = (channelRequestTimes.get(key) || []).filter(timestamp => timestamp > now - CHANNEL_WINDOW_MS)
+      const requestLimit = normalizeArenaRequestLimit(profiles.settings.channelRequestsPerMinute)
+      if (recent.length < requestLimit) {
+        recent.push(now)
+        channelRequestTimes.set(key, recent)
+        return
+      }
+      channelRequestTimes.set(key, recent)
+      await waitForChannel(Math.max(1, recent[0] + CHANNEL_WINDOW_MS - now), signal)
+    }
+  }
+
+  function guardedArenaStream(options, next) {
+    const selection = { provider: options.provider, model: options.model }
+    return (async function* () {
+      const context = arenaSessionContexts.get(String(options.sessionId || ''))
+      const startedAt = Date.now()
+      let usage = null
+      if (context?.countRequest !== false) recordRequest(context, { requests: 1 })
+      await waitForChannelCooldown(selection, options.signal)
+      const release = await acquireChannel(selection, options.signal)
+      try {
+        await waitForChannelCooldown(selection, options.signal)
+        await reserveChannelRequest(selection, options.signal)
+        for await (const chunk of next()) {
+          if (chunk?.type === 'usage' && chunk.usage) usage = chunk.usage
+          if (chunk?.type === 'finish' && chunk.reason?.kind === 'error') {
+            if (context?.countFailure !== false) recordRequest(context, { failures: 1 })
+            markChannelFailure(selection, chunk.reason.failure)
+          }
+          yield chunk
+        }
+        if (usage) {
+          const inputTokens = (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0) + (Number(usage.cacheWriteTokens) || 0)
+          recordRequest(context, {
+            inputTokens,
+            outputTokens: Number(usage.outputTokens) || 0,
+          })
+          if (context) roleActivity(context.container, context.profile).stats.lastInputTokens = inputTokens
+        }
+        if (context) {
+          const role = roleActivity(context.container, context.profile)
+          role.stats.lastDurationMs = Date.now() - startedAt
+          void persist().catch(() => undefined)
+        }
+      } catch (error) {
+        if (context?.countFailure !== false) recordRequest(context, { failures: 1 })
+        markChannelFailure(selection, error)
+        throw error
+      } finally {
+        release()
+      }
+    })()
+  }
+
+  ctx.effect(() => {
+    const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
+      const header = agent?.session?.header || {}
+      const sessionId = String(agent?.id || header.id || '')
+      const parentSessionId = String(header.parentSession || '')
+      if (arenaSessionIds.has(sessionId) || arenaSessionIds.has(parentSessionId)) arenaSessionIds.add(sessionId)
+      return next()
+    })
+    const disposeStream = ctx.on('llm/stream', (options, next) => {
+      if (!arenaSessionIds.has(String(options.sessionId || ''))) return next()
+      return guardedArenaStream(options, next)
+    })
+    const disposeApproval = ctx.on('approval/request', (req, next) => {
+      const context = containerForApproval(req?.agent)
+      if (!context) return next()
+      const approvalId = approvalIdForRequest(req)
+      if (!approvalId) return next()
+      const { container, profile } = context
+      const message = approvalMessage(container, approvalId, req, profile)
+      container.updatedAt = nowIso()
+      void persist()
+      return new Promise(resolve => {
+        pendingApprovals.set(approvalId, { approvalId, container, runtime: context.runtime, profile, resolve, message })
+        req.signal?.addEventListener('abort', () => {
+          const pending = pendingApprovals.get(approvalId)
+          if (!pending) return
+          pendingApprovals.delete(approvalId)
+          if (message.approval) message.approval.status = 'cancelled'
+          resolve('cancelled')
+          void persist()
+        }, { once: true })
+      })
+    }, true)
+    return () => {
+      disposeRequest()
+      disposeStream()
+      disposeApproval()
+      for (const pending of pendingApprovals.values()) pending.resolve('cancelled')
+      pendingApprovals.clear()
+      arenaSessionContexts.clear()
+      channelQueues.clear()
+      channelCooldowns.clear()
+      channelRequestTimes.clear()
+      arenaSessionIds.clear()
+    }
+  }, 'agent-arena: shared provider queue and cooldown')
 
   async function startRoleRun({ label, prompt, persona, profile, parent, runtime, outputSchema }) {
     const selection = modelSelection(profile)
-    const cooldown = cooldownInfo(selection)
-    if (cooldown) throw new Error(`共享渠道正在冷却，预计 ${Math.ceil(cooldown.remainingMs / 1000)} 秒后恢复`)
-    return withChannelQueue(selection, async () => {
-      const activeCooldown = cooldownInfo(selection)
-      if (activeCooldown) throw new Error(`共享渠道正在冷却，预计 ${Math.ceil(activeCooldown.remainingMs / 1000)} 秒后恢复`)
-      try {
-        const run = await ctx.subagents.start('spawn', {
-          label,
-          prompt: [{ type: 'text', text: prompt }],
-          parent: parent.agent,
-          signal: runtime.abort.signal,
-          persona: renderPersonaTemplate(persona, profile?.name || label, profiles.human.name),
-          ...(outputSchema ? { outputSchema } : {}),
-          agentOptions: selection,
-        })
-        runtime.activeRuns.add(run)
-        try { return await run.result } finally {
-          runtime.activeRuns.delete(run)
-          await run.dispose().catch(() => undefined)
-        }
-      } catch (error) {
-        markChannelFailure(selection, error)
-        throw error
-      }
-    })
+    const context = { container: runtime.container, runtime, profile, countRequest: false, countFailure: false }
+    recordRequest(context, { requests: 1 })
+    const startedAt = Date.now()
+    let run
+    try {
+      run = await ctx.subagents.start('spawn', {
+        label,
+        prompt: [{ type: 'text', text: prompt }],
+        parent: parent.agent,
+        signal: runtime.abort.signal,
+        persona: renderPersonaTemplate(persona, profile?.name || label, profiles.human.name),
+        ...(outputSchema ? { outputSchema } : {}),
+        agentOptions: selection,
+      })
+    } catch (error) {
+      recordRequest(context, { failures: 1 })
+      throw error
+    }
+    arenaSessionContexts.set(String(run.id), context)
+    runtime.activeRuns.add(run)
+    try {
+      const result = await run.result
+      if (result.stopReason?.kind === 'error' || result.stopReason === 'error') recordRequest(context, { failures: 1 })
+      return result
+    } catch (error) {
+      recordRequest(context, { failures: 1 })
+      throw error
+    } finally {
+      roleActivity(runtime.container, profile).stats.lastDurationMs = Date.now() - startedAt
+      arenaSessionContexts.delete(String(run.id))
+      runtime.activeRuns.delete(run)
+      await run.dispose().catch(() => undefined)
+      void persist().catch(() => undefined)
+    }
   }
 
   function summarizeAgentTurn(events, firstSeq) {
@@ -1171,9 +1670,11 @@ export function apply(ctx, config = {}) {
   async function createFullRoleAgent({ label, profile, runtime }) {
     const composition = await resolveAgentPreset()
     const selection = modelSelection(profile)
+    const sessionId = randomUUID()
+    arenaSessionIds.add(sessionId)
     const handle = await ctx.agents.create({
-      sessionId: randomUUID(),
-      meta: { cwd: process.cwd(), ...(composition.id ? { agentPreset: composition.id } : {}) },
+      sessionId,
+      meta: { cwd: runtime.workdir, ...(composition.id ? { agentPreset: composition.id } : {}) },
       agentOptions: selection,
       signal: runtime.abort.signal,
       async setup(agentCtx) {
@@ -1194,17 +1695,31 @@ export function apply(ctx, config = {}) {
         installCoordinationPlane(agentCtx, runtime, profile)
       },
     })
+    applyAgentPermission(handle, permissionFor(runtime.container, profile.id))
     await archiveArenaAgent(handle)
     runtime.agentHandles.add(handle)
+    arenaSessionContexts.set(String(handle.agent.id), { container: runtime.container, runtime, profile })
     runtime.abort.signal.addEventListener('abort', () => handle.agent.cancel({ kind: 'user' }), { once: true })
     return handle
   }
 
   async function roleAgent(runtime, key, label, profile) {
     let pending = runtime.roleAgents.get(key)
+    const generation = 0
+    runtime.roleGenerations ??= new Map()
+    if (pending && runtime.roleGenerations.get(key) !== generation) {
+      const old = await pending
+      await old.agent.whenIdle()
+      arenaSessionContexts.delete(String(old.agent.id))
+      await old.dispose().catch(() => undefined)
+      runtime.agentHandles.delete(old)
+      runtime.roleAgents.delete(key)
+      pending = undefined
+    }
     if (!pending) {
       pending = createFullRoleAgent({ label, profile, runtime })
       runtime.roleAgents.set(key, pending)
+      runtime.roleGenerations.set(key, generation)
     }
     return pending
   }
@@ -1226,17 +1741,17 @@ export function apply(ctx, config = {}) {
     const args = parsedToolArguments(rawArguments)
     const detailValue = args.file_path ?? args.path ?? args.query ?? args.url ?? args.task ?? args.action ?? args.cmd ?? args.command ?? ''
     const detail = String(detailValue || '').replace(/\s+/g, ' ').trim().slice(0, 180)
-    if (name === 'arena_send_message') return { status: 'working', stage: '正在发送群消息', label: '发送消息', detail: String(args.text || '').replace(/\s+/g, ' ').trim().slice(0, 180) }
-    if (name === 'arena_coordination') return { status: 'working', stage: '同步协作状态', label: '协作板', detail }
-    if (/subagent|spawn_agent|create_thread|workflow/.test(lower)) return { status: 'delegating', stage: '正在调度子 Agent', label: name, detail }
-    if (mutationTargets(name, args).length) return { status: 'editing', stage: '正在编辑文件', label: name, detail }
+    if (name === 'arena_send_message') return { status: 'working', stage: uiMessage("toolactivity.sending.a.group.message"), label: '发送消息', detail: String(args.text || '').replace(/\s+/g, ' ').trim().slice(0, 180) }
+    if (name === 'arena_coordination') return { status: 'working', stage: uiMessage("toolactivity.synchronizing.collaboration.status"), label: '协作板', detail }
+    if (/subagent|spawn_agent|create_thread|workflow/.test(lower)) return { status: 'delegating', stage: uiMessage("toolactivity.delegating.to.subagents"), label: name, detail }
+    if (mutationTargets(name, args).length) return { status: 'editing', stage: uiMessage("toolactivity.editing.files"), label: name, detail }
     if (/test|check|lint|build/.test(lower) || /(?:npm|pnpm|yarn).{0,12}(?:test|check|build)|pytest|vitest|jest/.test(String(args.cmd ?? ''))) {
-      return { status: 'testing', stage: '正在运行检查或测试', label: name, detail }
+      return { status: 'testing', stage: uiMessage("toolactivity.running.checks.or.tests"), label: name, detail }
     }
-    if (/read|search|find|grep|glob|list|view/.test(lower)) return { status: 'researching', stage: '正在查看资料或代码', label: name, detail }
-    if (/web|browser|fetch|open_url/.test(lower)) return { status: 'researching', stage: '正在浏览外部资料', label: name, detail }
-    if (/run_code|exec|bash|pwsh|command|terminal/.test(lower)) return { status: 'tool', stage: '正在执行命令或代码', label: name, detail }
-    return { status: 'tool', stage: `正在使用 ${name}`, label: name, detail }
+    if (/read|search|find|grep|glob|list|view/.test(lower)) return { status: 'researching', stage: uiMessage("toolactivity.reading.reference.material.or.code"), label: name, detail }
+    if (/web|browser|fetch|open_url/.test(lower)) return { status: 'researching', stage: uiMessage("toolactivity.browsing.external.sources"), label: name, detail }
+    if (/run_code|exec|bash|pwsh|command|terminal/.test(lower)) return { status: 'tool', stage: uiMessage("toolactivity.running.commands.or.code"), label: name, detail }
+    return { status: 'tool', stage: uiMessage("toolactivity.using.value", { p0: name }), label: name, detail }
   }
 
   function observeAgentEvents(handle, firstSeq, runtime, profile) {
@@ -1248,24 +1763,24 @@ export function apply(ctx, config = {}) {
         lastSeq = Math.max(lastSeq, event.seq)
         if (event.type === 'assistant/chunk') {
           if (event.data?.chunk?.type === 'reasoning-delta' || event.data?.chunk?.type === 'text-delta') {
-            setRoleActivity(runtime.container, profile, { status: 'thinking', stage: '正在思考并组织回复', currentTool: '' })
+            setRoleActivity(runtime.container, profile, { status: 'thinking', stage: uiMessage("observeagentevents.thinking.and.composing.a.reply"), currentTool: '' })
           }
         } else if (event.type === 'tool/call') {
           const activity = toolActivity(event.data?.name, event.data?.arguments)
           calls.set(String(event.data?.callId || ''), activity)
-          setRoleActivity(runtime.container, profile, { status: activity.status, stage: activity.stage, detail: activity.detail, currentTool: activity.label }, `${activity.stage}${activity.detail ? `：${activity.detail}` : ''}`, 'tool', event.time)
+          setRoleActivity(runtime.container, profile, { status: activity.status, stage: activity.stage, detail: activity.detail, currentTool: activity.label }, withMessageDetail(activity.stage, activity.detail), 'tool', event.time)
         } else if (event.type === 'tool/code-dispatch-start') {
           const activity = toolActivity(event.data?.name, event.data?.arguments)
           calls.set(String(event.data?.subCallId || ''), activity)
-          setRoleActivity(runtime.container, profile, { status: activity.status, stage: activity.stage, detail: activity.detail, currentTool: activity.label }, `${activity.stage}${activity.detail ? `：${activity.detail}` : ''}`, 'tool', event.time)
+          setRoleActivity(runtime.container, profile, { status: activity.status, stage: activity.stage, detail: activity.detail, currentTool: activity.label }, withMessageDetail(activity.stage, activity.detail), 'tool', event.time)
         } else if (event.type === 'tool/result') {
           const activity = calls.get(String(event.data?.message?.callId || ''))
-          if (activity) setRoleActivity(runtime.container, profile, { status: 'working', stage: event.data?.message?.isError ? `${activity.label} 执行失败` : `正在分析 ${activity.label} 的结果`, currentTool: '' }, `${activity.label}${event.data?.message?.isError ? ' 执行失败' : ' 已完成'}`, event.data?.message?.isError ? 'error' : 'success', event.time)
+          if (activity) setRoleActivity(runtime.container, profile, { status: 'working', stage: event.data?.message?.isError ? uiMessage("observeagentevents.value.failed", { p0: activity.label }) : uiMessage("observeagentevents.analyzing.the.result.of.value", { p0: activity.label }), currentTool: '' }, uiMessage(event.data?.message?.isError ? 'activity.toolFailed' : 'activity.toolCompleted', { p0: activity.label }), event.data?.message?.isError ? 'error' : 'success', event.time)
         } else if (event.type === 'tool/code-dispatch') {
           const activity = calls.get(String(event.data?.subCallId || '')) || toolActivity(event.data?.name, event.data?.arguments)
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: event.data?.isError ? `${activity.label} 执行失败` : `正在分析 ${activity.label} 的结果`, currentTool: '' }, `${activity.label}${event.data?.isError ? ' 执行失败' : ' 已完成'}`, event.data?.isError ? 'error' : 'success', event.time)
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: event.data?.isError ? uiMessage("observeagentevents.value.failed", { p0: activity.label }) : uiMessage("observeagentevents.analyzing.the.result.of.value", { p0: activity.label }), currentTool: '' }, uiMessage(event.data?.isError ? 'activity.toolFailed' : 'activity.toolCompleted', { p0: activity.label }), event.data?.isError ? 'error' : 'success', event.time)
         } else if (event.type === 'assistant/message') {
-          setRoleActivity(runtime.container, profile, { status: 'working', stage: '已生成阶段回复', currentTool: '' }, '生成了一条阶段回复', 'message', event.time)
+          setRoleActivity(runtime.container, profile, { status: 'working', stage: uiMessage("observeagentevents.generated.an.interim.reply"), currentTool: '' }, uiMessage("observeagentevents.generated.an.interim.reply.2"), 'message', event.time)
         }
       }
     }
@@ -1275,7 +1790,7 @@ export function apply(ctx, config = {}) {
     return () => { clearInterval(timer); scan() }
   }
 
-  async function runFullAgentTurn(handle, prompt, runtime, profile, phase = 'work') {
+  async function runFullAgentTurnOnce(handle, prompt, runtime, profile, phase = 'work') {
     if (runtime.abort.signal.aborted) throw new Error('任务已终止')
     await handle.agent.whenIdle()
     const firstSeq = handle.agent.session.seq
@@ -1288,9 +1803,9 @@ export function apply(ctx, config = {}) {
     }
     setRoleActivity(runtime.container, profile, {
       status: phase === 'ack' ? 'acknowledging' : 'thinking',
-      stage: phase === 'ack' ? '正在确认新消息' : '正在理解任务并规划',
+      stage: phase === 'ack' ? uiMessage("runfullagentturnonce.acknowledging.a.new.message") : uiMessage("runfullagentturnonce.understanding.the.task.and.planning"),
       detail: '', currentTool: '',
-    }, phase === 'ack' ? '开始确认新消息' : '开始处理任务')
+    }, phase === 'ack' ? uiMessage("runfullagentturnonce.started.acknowledging.a.new.message") : uiMessage("runfullagentturnonce.started.working.on.the.task"))
     handle.agent.followup(createArenaUserMessage(prompt))
     const stopObserving = observeAgentEvents(handle, firstSeq, runtime, profile)
     try { await handle.agent.whenIdle() } finally {
@@ -1299,11 +1814,41 @@ export function apply(ctx, config = {}) {
     }
     const outcome = summarizeAgentTurn(handle.agent.session.events, firstSeq)
     if (outcome.error) {
-      setRoleActivity(runtime.container, profile, { status: 'error', stage: '本轮运行失败', detail: outcome.error, currentTool: '' }, outcome.error, 'error')
-      throw new Error(outcome.error)
+      const failure = new Error(outcome.error)
+      failure.autonomousMessageIds = [...(messageTurn?.messageIds ?? [])]
+      if (!isArenaEmptyResponseFailure(failure)) {
+        setRoleActivity(runtime.container, profile, { status: 'error', stage: uiMessage("runfullagentturnonce.this.turn.failed"), detail: outcome.error, currentTool: '' }, outcome.error, 'error')
+      }
+      throw failure
     }
-    setRoleActivity(runtime.container, profile, { status: 'working', stage: phase === 'ack' ? '已确认，准备正式工作' : '本轮工作已完成', currentTool: '' })
+    setRoleActivity(runtime.container, profile, { status: 'working', stage: phase === 'ack' ? uiMessage("runfullagentturnonce.acknowledged.preparing.to.work") : uiMessage("runfullagentturnonce.work.for.this.turn.is.complete"), currentTool: '' })
     return { ...outcome, autonomousMessageIds: [...(messageTurn?.messageIds ?? [])] }
+  }
+
+  async function runFullAgentTurn(handle, prompt, runtime, profile, phase = 'work') {
+    try {
+      return await runFullAgentTurnOnce(handle, prompt, runtime, profile, phase)
+    } catch (error) {
+      if (!isArenaEmptyResponseFailure(error) || runtime.abort.signal.aborted || runtime.cancelCurrentWork) throw error
+      const firstMessageIds = Array.isArray(error?.autonomousMessageIds) ? error.autonomousMessageIds : []
+      if (firstMessageIds.length) {
+        return { text: '', stopReason: 'empty-response', error: '', autonomousMessageIds: firstMessageIds, silent: true }
+      }
+      setRoleActivity(runtime.container, profile, {
+        status: 'thinking', stage: uiMessage("runfullagentturn.empty.response.retrying.automatically"), detail: '', currentTool: '',
+      }, uiMessage("runfullagentturn.detected.an.empty.response.retrying.once"))
+      recordRequest({ container: runtime.container, profile }, { retries: 1 })
+      try {
+        return await runFullAgentTurnOnce(handle, prompt, runtime, profile, phase)
+      } catch (retryError) {
+        if (!isArenaEmptyResponseFailure(retryError) || runtime.abort.signal.aborted || runtime.cancelCurrentWork) throw retryError
+        return {
+          text: '', stopReason: 'empty-response', error: '',
+          autonomousMessageIds: Array.isArray(retryError?.autonomousMessageIds) ? retryError.autonomousMessageIds : [],
+          silent: true,
+        }
+      }
+    }
   }
 
   function latestHumanRequest(container, isMeeting) {
@@ -1322,7 +1867,7 @@ export function apply(ctx, config = {}) {
       '只响应人类明确要求。不得修改模型、密钥、权限或文件。reply 是要在群里公开显示的简洁确认。',
       '',
       '最近记录：',
-      transcriptText(isMeeting ? container.transcript : container.messages),
+       isMeeting ? meetingContextText(container, 'administrator') : transcriptText(container.messages),
     ].join('\n')
   }
 
@@ -1348,7 +1893,7 @@ export function apply(ctx, config = {}) {
   }
 
   function appendSystem(container, text, isMeeting) {
-    const item = { id: randomUUID(), kind: 'system', text, createdAt: nowIso() }
+    const item = { id: randomUUID(), kind: 'system', text: uiText(text), i18n: messageDescriptor(text), createdAt: nowIso() }
     if (isMeeting) container.transcript.push({ ...item, speakerId: 'system', speaker: '系统' })
     else container.messages.push({ ...item, senderId: 'system', senderName: '系统', avatar: 'ℹ️' })
   }
@@ -1400,15 +1945,15 @@ export function apply(ctx, config = {}) {
     const names = ids => ids.map(id => container.participants.find(item => item.id === id)?.name).filter(Boolean).join('、')
     for (const id of newlyMuted) {
       const profile = container.participants.find(item => item.id === id)
-      if (profile) setRoleActivity(container, profile, { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] }, '被人类用户设为静默')
+      if (profile) setRoleActivity(container, profile, { status: 'muted', stage: uiMessage("role_activity.muted"), detail: '', currentTool: '', claimedFiles: [] }, uiMessage("applyspeechcontrols.muted.by.the.human.user"))
       if (runtime) releaseRoleClaims(runtime, id)
     }
     for (const id of newlyUnmuted) {
       const profile = container.participants.find(item => item.id === id)
-      if (profile) setRoleActivity(container, profile, { status: 'idle', stage: '已恢复，等待消息', detail: '', currentTool: '' }, '恢复发言')
+      if (profile) setRoleActivity(container, profile, { status: 'idle', stage: uiMessage("applyspeechcontrols.unmuted.waiting.for.a.message"), detail: '', currentTool: '' }, uiMessage("applyspeechcontrols.unmuted"))
     }
-    if (newlyMuted.length) appendSystem(container, `${names(newlyMuted)} 已静默；在恢复发言前不会再被请求，也不会发送正在进行任务的结果。`, isMeeting)
-    if (newlyUnmuted.length) appendSystem(container, `${names(newlyUnmuted)} 已恢复发言。`, isMeeting)
+    if (newlyMuted.length) appendSystem(container, uiMessage("applyspeechcontrols.value.has.been.muted.no.further.requests.or.in", { p0: names(newlyMuted) }), isMeeting)
+    if (newlyUnmuted.length) appendSystem(container, uiMessage("applyspeechcontrols.value.has.been.unmuted", { p0: names(newlyUnmuted) }), isMeeting)
     if (runtime) runtime.skipAutoContinuation = directives.commandOnly
     return directives
   }
@@ -1421,19 +1966,19 @@ export function apply(ctx, config = {}) {
 
   async function applyMeetingAdminAction(meeting, runtime, result) {
     if (result.action === 'change-topic') {
-      if (result.topic.length < 2) appendSystem(meeting, '管理员没有识别到有效的新话题，请用“把话题改为：……”再试一次。', true)
+      if (result.topic.length < 2) appendSystem(meeting, uiMessage("applymeetingadminaction.the.administrator.could.not.identify.a.new.topic.try"), true)
       else {
         meeting.topic = result.topic.slice(0, 2000)
         runtime.targetIds = new Set(meeting.participants.map(item => item.id))
-        appendSystem(meeting, `管理员已将话题更改为：${meeting.topic}`, true)
+        appendSystem(meeting, uiMessage("applymeetingadminaction.the.administrator.changed.the.topic.to.value", { p0: meeting.topic }), true)
       }
     } else if (result.action === 'reopen-decision') {
       ensureMeetingWorkspace(meeting)
       const latest = [...meeting.decisions].reverse().find(item => item.status === 'decided')
       if (latest) {
         reopenWorkspaceDecision(meeting, { decisionId: latest.id })
-        appendSystem(meeting, `管理员已重开决策“${latest.title}”。`, true)
-      } else appendSystem(meeting, '当前没有可以重开的已决策事项。', true)
+        appendSystem(meeting, uiMessage("applymeetingadminaction.the.administrator.reopened.decision.value", { p0: latest.title }), true)
+      } else appendSystem(meeting, uiMessage("applymeetingadminaction.there.are.no.completed.decisions.to.reopen"), true)
     } else if (result.action === 'continue') {
       meeting.participants.filter(item => !isMuted(meeting, item.id)).forEach(item => runtime.targetIds.add(item.id))
     } else if (result.action === 'pause') {
@@ -1442,13 +1987,14 @@ export function apply(ctx, config = {}) {
       runtime.summaryRequested = true
     } else if (result.action === 'set-stage' && MEETING_STAGES.includes(result.stage) && result.stage !== 'completed') {
       meeting.collaborationStage = result.stage
-      appendSystem(meeting, `管理员已将协作阶段切换为：${result.stage}`, true)
+      appendSystem(meeting, uiMessage("applymeetingadminaction.the.administrator.changed.the.collaboration.stage.to.value", { p0: result.stage }), true)
     }
   }
 
   async function runMeetingAdmin(meeting, command, runtime) {
     const admin = meeting.administratorProfile
-    setRoleActivity(meeting, admin, { status: 'working', stage: '正在处理管理指令', detail: command.slice(0, 240), currentTool: '' }, '开始处理管理指令')
+    let failed = false
+    setRoleActivity(meeting, admin, { status: 'working', stage: uiMessage("runmeetingadmin.handling.an.administrator.command"), detail: command.slice(0, 240), currentTool: '' }, uiMessage("runmeetingadmin.started.handling.an.administrator.command"))
     try {
       const result = await askAdministrator(meeting, command, runtime.parent, runtime, true)
       meeting.transcript.push({
@@ -1457,10 +2003,10 @@ export function apply(ctx, config = {}) {
       })
       await applyMeetingAdminAction(meeting, runtime, result)
     } catch (error) {
-      appendSystem(meeting, `管理员处理失败：${safeError(error)}`, true)
-      setRoleActivity(meeting, admin, { status: 'error', stage: '管理指令处理失败', detail: safeError(error) }, safeError(error), 'error')
+      failed = true
+      setRoleActivity(meeting, admin, { status: 'error', stage: uiMessage("runmeetingadmin.the.administrator.command.failed"), detail: safeError(error) }, safeError(error), 'error')
     } finally {
-      setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', currentTool: '' })
+      if (!failed) setRoleActivity(meeting, admin, { status: 'idle', stage: uiMessage("runmeetingadmin.waiting.for.an.administrator.command"), currentTool: '' })
     }
   }
 
@@ -1468,6 +2014,7 @@ export function apply(ctx, config = {}) {
     if (runtime.abort.signal.aborted) throw new Error('会议运行已停止')
     if (!runtime.pauseRequested) return true
     meeting.status = 'paused'
+    updateRun(meeting, 'paused', runtime.summaryRequested ? 'summary' : 'idle')
     meeting.updatedAt = nowIso()
     await persist()
     return false
@@ -1475,18 +2022,27 @@ export function apply(ctx, config = {}) {
 
   async function runOne(meeting, participant, runtime) {
     if (isMuted(meeting, participant.id)) return
+    let failed = false
     participant.status = 'working'
     meeting.updatedAt = nowIso()
     await persist()
     try {
       const handle = await roleAgent(runtime, participant.id, `arena:${meeting.id}:${participant.name}`, participant)
+      if (await maybeAutoCompressMeeting(meeting, participant, runtime, handle)) await persist()
       if (runtime.abort.signal.aborted || runtime.cancelCurrentWork || isMuted(meeting, participant.id)) return
       participant.status = 'working'
       meeting.updatedAt = nowIso()
       await persist()
-      const result = await runFullAgentTurn(handle, participantPrompt(meeting, participant, coordinationPrompt(runtime, participant.id)), runtime, participant, 'work')
+      const afterMessageId = runtime.roleContextDelivered?.get(participant.id) || null
+      const latestContextMessageId = [...meeting.transcript].reverse().find(item => item.kind !== 'system')?.id
+      const result = await runFullAgentTurn(handle, participantPrompt(meeting, participant, coordinationPrompt(runtime, participant.id), afterMessageId), runtime, participant, 'work')
+      if (latestContextMessageId) {
+        runtime.roleContextDelivered ??= new Map()
+        runtime.roleContextDelivered.set(participant.id, latestContextMessageId)
+      }
       if (runtime.abort.signal.aborted || runtime.cancelCurrentWork) return
       if (isMuted(meeting, participant.id)) return
+      if (result.silent && !result.autonomousMessageIds.length) return
       if (!result.autonomousMessageIds.length) {
         meeting.transcript.push({
           id: randomUUID(), kind: 'participant', phase: 'result', turn: meeting.turnCount, speakerId: participant.id,
@@ -1497,18 +2053,16 @@ export function apply(ctx, config = {}) {
       }
     } catch (error) {
       if (runtime.cancelCurrentWork || runtime.abort.signal.aborted) return
-      setRoleActivity(meeting, participant, { status: 'error', stage: '本轮工作失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-      if (!runtime.abort.signal.aborted && !isMuted(meeting, participant.id)) meeting.transcript.push({
-        id: randomUUID(), kind: 'participant', turn: meeting.turnCount, speakerId: participant.id,
-        speaker: participant.name, avatar: participant.avatar, text: `发言失败：${safeError(error)}`,
-        createdAt: nowIso(), failed: true,
-      })
+      failed = true
+      setRoleActivity(meeting, participant, { status: 'error', stage: uiMessage("runone.work.failed.for.this.turn"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
       releaseRoleClaims(runtime, participant.id)
       participant.status = 'idle'
-      setRoleActivity(meeting, participant, isMuted(meeting, participant.id)
-        ? { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] }
-        : { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      if (isMuted(meeting, participant.id)) {
+        setRoleActivity(meeting, participant, { status: 'muted', stage: uiMessage("role_activity.muted"), detail: '', currentTool: '', claimedFiles: [] })
+      } else if (!failed) {
+        setRoleActivity(meeting, participant, { status: 'idle', stage: uiMessage("runone.waiting.for.follow.up.messages"), detail: '', currentTool: '', claimedFiles: [] })
+      }
       meeting.updatedAt = nowIso()
       await persist().catch(() => undefined)
     }
@@ -1521,10 +2075,10 @@ export function apply(ctx, config = {}) {
     if (!profiles.settings.autoReplyEnabled) return []
     const available = container.participants.filter(item => !isMuted(container, item.id))
     return Promise.all(available.map(async profile => {
-      if (profiles.settings.autoReplyDecisionMode === 'admin' || profile.autoReplyDisabled) {
-        return { profile, shouldSpeak: true, reason: profile.autoReplyDisabled ? '此角色已关闭自动接话判断，等待管理员分配。' : '当前由管理员统一决定是否接话。' }
-      }
-      setRoleActivity(container, profile, { status: 'thinking', stage: '正在判断是否需要接话', detail: '', currentTool: '' })
+      if (profile.autoReplyDisabled) return { profile, shouldSpeak: true, reason: '此角色已关闭独立判断，请管理员直接判断它是否适合接话。' }
+      recordRequest({ container, profile }, { intentChecks: 1 })
+      let failed = false
+      setRoleActivity(container, profile, { status: 'thinking', stage: uiMessage("collectreplyintents.checking.whether.to.reply"), detail: '', currentTool: '' })
       try {
         const result = await startRoleRun({
           label: `arena:${container.id}:reply-intent:${profile.id}`,
@@ -1539,7 +2093,7 @@ export function apply(ctx, config = {}) {
             'shouldSpeak=false：你的观点已经说过；只能礼貌附和或重复；必须等待人类提供信息；话头已经收束；或准备说的内容偏离人类当前焦点。尤其不要为了热闹而继续。',
             '连续自己接自己的话只在补交真实工作进度或结果时合理。reason 只写一句内部判断依据，不要在这里生成真正的群聊回复。',
             ...(isMeeting ? ['', '协作控制台：', meetingWorkspaceText(container)] : []),
-            '', '完整群聊记录：', transcriptText(records),
+            '', '完整群聊记录：', isMeeting ? meetingContextText(container, profile.id) : transcriptText(records),
           ].join('\n'),
           persona: `你是 ${profile.name}。${profile.role || '保持自然，并只在有实质内容时继续发言。'}`,
           profile,
@@ -1550,10 +2104,11 @@ export function apply(ctx, config = {}) {
         const intent = result.structured && typeof result.structured === 'object' ? result.structured : {}
         return { profile, shouldSpeak: intent.shouldSpeak === true, reason: String(intent.reason || '').trim().slice(0, 500) }
       } catch (error) {
-        setRoleActivity(container, profile, { status: 'error', stage: '接话判断失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
+        failed = true
+        setRoleActivity(container, profile, { status: 'error', stage: uiMessage("collectreplyintents.follow.up.check.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
         return { profile, shouldSpeak: false, reason: `判断失败：${safeError(error)}` }
       } finally {
-        setRoleActivity(container, profile, { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '' })
+        if (!failed) setRoleActivity(container, profile, { status: 'idle', stage: uiMessage("runone.waiting.for.follow.up.messages"), detail: '', currentTool: '' })
       }
     }))
   }
@@ -1561,21 +2116,22 @@ export function apply(ctx, config = {}) {
   async function guardContinuation(container, intents, runtime, isMeeting) {
     if (!intents.length) return { onTopic: true, complete: true, approvedSpeakerIds: [], reason: '没有角色希望继续接话。' }
     const admin = container.administratorProfile
+    let failed = false
     const focus = latestHumanRequest(container, isMeeting)
-    setRoleActivity(container, admin, { status: 'working', stage: '正在检查跑题与刷屏风险', detail: '', currentTool: '' }, '复核角色接话意愿')
+    setRoleActivity(container, admin, { status: 'working', stage: uiMessage("guardcontinuation.checking.for.off.topic.replies.and.flooding"), detail: '', currentTool: '' }, uiMessage("guardcontinuation.reviewing.follow.up.intentions"))
     try {
       const result = await startRoleRun({
         label: `arena:${container.id}:continuation-guard`,
         prompt: [
-          `你是群管理员 ${admin.name}。角色已经各自判断是否接话，你只负责防止跑题、重复和刷屏，不替他们决定观点。`,
+          `你是群管理员 ${admin.name}。通常角色会先判断是否接话；关闭独立判断的角色则由你直接判断。你负责选择下一位发言者，并防止跑题、重复和刷屏。`,
           `人类当前讨论焦点：${focus}`,
           ...(isMeeting ? [`会议主题：${container.topic}`] : [`群聊名称：${container.name}`]),
-          '候选角色及其内部理由：',
+          '候选角色及其判断或分配说明：',
           intents.map(item => `- ${item.profile.name} (${item.profile.id})：${item.reason || '未说明'}`).join('\n'),
           '如果候选发言会明显偏离人类最近的焦点，onTopic=false、complete=true、approvedSpeakerIds=[]，停止本次自动接话并等待人类。相关子问题、必要的澄清和任务执行不算跑题。',
           '如果只是重复、附和、抢话或没有实际推进，也应 complete=true。否则 onTopic=true、complete=false，并且只批准最适合接下一句话的 1 位。这样该角色发言后，所有角色会基于这条新消息再次独立判断。',
           'approvedSpeakerIds 只能来自上面的候选角色。',
-          '', '完整群聊记录：', transcriptText(isMeeting ? container.transcript : container.messages),
+           '', '完整群聊记录：', isMeeting ? meetingContextText(container, 'administrator') : transcriptText(container.messages),
         ].join('\n'),
         persona: `你是 ${admin.name}。${admin.role || '负责让群聊保持聚焦、自然且不刷屏。'}`,
         profile: admin,
@@ -1591,26 +2147,24 @@ export function apply(ctx, config = {}) {
         reason: String(decision.reason || '').trim(),
       }
     } catch (error) {
+      failed = true
+      setRoleActivity(container, admin, { status: 'error', stage: uiMessage("guardcontinuation.follow.up.review.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
       return { onTopic: true, complete: false, approvedSpeakerIds: [intents[0].profile.id], reason: `管理员复核失败，采用首位角色的独立判断：${safeError(error)}` }
     } finally {
-      setRoleActivity(container, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (!failed) setRoleActivity(container, admin, { status: 'idle', stage: uiMessage("runmeetingadmin.waiting.for.an.administrator.command"), detail: '', currentTool: '' })
     }
   }
 
   async function evaluateMeetingContinuation(meeting, completedIds, runtime, requirePeerReaction = false) {
     if (runtime.summaryRequested || runtime.pauseRequested || runtime.cancelCurrentWork || runtime.abort.signal.aborted) return
     const admin = meeting.administratorProfile
-    setRoleActivity(meeting, admin, { status: 'working', stage: '等待各角色判断是否接话', detail: '', currentTool: '' }, '启动逐角色接话判断')
+    setRoleActivity(meeting, admin, { status: 'working', stage: uiMessage("evaluatemeetingcontinuation.waiting.for.follow.up.checks"), detail: '', currentTool: '' }, uiMessage("evaluatemeetingcontinuation.started.per.role.follow.up.checks"))
     try {
       if (!profiles.settings.autoReplyEnabled) return
       const intents = (await collectReplyIntents(meeting, completedIds, runtime, true, requirePeerReaction)).filter(item => item.shouldSpeak)
-      const decision = profiles.settings.autoReplyDecisionMode === 'admin'
-        ? await guardContinuation(meeting, intents, runtime, true)
-        : await guardContinuation(meeting, intents.filter(item => !item.profile.autoReplyDisabled), runtime, true)
+      const decision = await guardContinuation(meeting, intents, runtime, true)
       if (decision.complete || !decision.onTopic) {
-        appendSystem(meeting, decision.onTopic
-          ? '当前任务已自然告一段落，AI 成员正在等待你的新消息。'
-          : '接话方向开始偏离人类当前焦点，已停止 AI 自动接话并等待你的下一步指示。', true)
+        appendSystem(meeting, decision.onTopic ? uiMessage("evaluatemeetingcontinuation.the.current.task.has.reached.a.natural.stopping.point") : uiMessage("evaluatemeetingcontinuation.automatic.follow.ups.were.stopped.because.they.were.moving"), true)
         return
       }
       const candidates = new Set(intents.map(item => item.profile.id))
@@ -1618,22 +2172,22 @@ export function apply(ctx, config = {}) {
       for (const id of next.length ? next : intents.slice(0, 1).map(item => item.profile.id)) runtime.targetIds.add(id)
       runtime.triggerSource = 'auto'
     } catch (error) {
-      appendSystem(meeting, `逐角色接话判断失败，已先等待你的下一条消息：${safeError(error)}`, true)
+      setRoleActivity(meeting, admin, { status: 'error', stage: uiMessage("evaluatemeetingcontinuation.the.follow.up.check.process.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
-      setRoleActivity(meeting, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (roleActivity(meeting, admin).status !== 'error') setRoleActivity(meeting, admin, { status: 'idle', stage: uiMessage("runmeetingadmin.waiting.for.an.administrator.command"), detail: '', currentTool: '' })
     }
   }
 
   async function runStageSummary(meeting, runtime) {
     const admin = meeting.administratorProfile
-    setRoleActivity(meeting, admin, { status: 'working', stage: '正在整理阶段总结', detail: '', currentTool: '' }, '开始整理阶段总结')
+    setRoleActivity(meeting, admin, { status: 'working', stage: uiMessage("runstagesummary.preparing.a.progress.summary"), detail: '', currentTool: '' }, uiMessage("runstagesummary.started.preparing.a.progress.summary"))
     const result = await startRoleRun({
       label: `arena:${meeting.id}:stage-summary`,
       prompt: [
         `你是 ${admin.name}，请为仍将继续的协作会议生成一份阶段总结。话题：${meeting.topic}`,
         'summary 总结截至目前已经达成的共识、完成的工作和可直接使用的成果；rationale 写清关键依据、风险和取舍；openItems 列出仍需人类决定或后续处理的事项。不要宣告会议结束，不要评选获胜角色。',
         '', '协作控制台：', meetingWorkspaceText(meeting),
-        '', '完整公开记录：', transcriptText(meeting.transcript),
+        '', '完整公开记录：', meetingContextText(meeting, 'administrator'),
       ].join('\n'),
       persona: `你是中立的会议管理员 ${admin.name}。`,
       profile: admin,
@@ -1660,7 +2214,7 @@ export function apply(ctx, config = {}) {
       artifactType: 'summary', ownerId: 'administrator',
     }, 'administrator').status = 'accepted'
     meeting.collaborationStage = 'waiting-human'
-    setRoleActivity(meeting, admin, { status: 'idle', stage: '阶段总结已生成，等待后续消息', detail: '', currentTool: '' }, '完成阶段总结', 'success')
+    setRoleActivity(meeting, admin, { status: 'idle', stage: uiMessage("runstagesummary.progress.summary.ready.waiting.for.follow.up.messages"), detail: '', currentTool: '' }, uiMessage("runstagesummary.completed.the.progress.summary"), 'success')
   }
 
   async function runMeeting(meeting) {
@@ -1674,14 +2228,17 @@ export function apply(ctx, config = {}) {
       summaryRequested: pending?.summaryRequested === true, targetIds: new Set(initialTargets), adminCommands: [...(pending?.adminCommands ?? [])], parent: undefined,
       roleAgents: new Map(), agentHandles: new Set(), skipAutoContinuation: false,
       triggerSource: pending?.triggerSource || 'initial', container: meeting, isMeeting: true, fileClaims: new Map(),
+      workdir: runtimeWorkdir(meeting),
     }
     runtimes.set(meeting.id, runtime)
     ensureActivityMonitor(meeting)
     meeting.status = 'running'
+    updateRun(meeting, 'running', pending?.summaryRequested ? 'summary' : pending?.currentTaskId ? 'task' : pending?.triggerSource === 'human' ? 'responding' : 'working', pending?.currentTaskId ?? meeting.run?.currentTaskId ?? null)
     meeting.updatedAt = nowIso()
     await persist()
     try {
-      runtime.parent = await createParent('Agent Arena collaborative meeting', runtime.abort.signal)
+      await normalizeRoomWorkdir(runtime.workdir)
+      runtime.parent = await createParent('Agent Arena collaborative meeting', runtime.abort.signal, runtime.workdir)
       while (!runtime.abort.signal.aborted) {
         if (!await checkpoint(meeting, runtime)) break
         while (runtime.adminCommands.length) {
@@ -1693,8 +2250,7 @@ export function apply(ctx, config = {}) {
         if (runtime.summaryRequested && !runtime.targetIds.size) {
           runtime.summaryRequested = false
           await runStageSummary(meeting, runtime).catch(error => {
-            setRoleActivity(meeting, meeting.administratorProfile, { status: 'error', stage: '阶段总结失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-            appendSystem(meeting, `阶段总结失败：${safeError(error)}`, true)
+            setRoleActivity(meeting, meeting.administratorProfile, { status: 'error', stage: uiMessage("runmeeting.progress.summary.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
           })
           await persist()
           runtime.pauseRequested = true
@@ -1707,6 +2263,9 @@ export function apply(ctx, config = {}) {
           continue
         }
         meeting.turnCount = Number(meeting.turnCount || 0) + 1
+        meeting.run.lastTargetIds = ids
+        meeting.run.updatedAt = nowIso()
+        await persist()
         const triggerSource = runtime.triggerSource
         runtime.triggerSource = 'auto'
         await Promise.all(ids.map(async id => {
@@ -1725,19 +2284,25 @@ export function apply(ctx, config = {}) {
       }
     } catch (error) {
       meeting.error = runtime.abort.signal.aborted ? null : safeError(error)
+      if (!runtime.abort.signal.aborted) setRoleActivity(meeting, meeting.administratorProfile, {
+        status: 'error', stage: uiMessage("runmeeting.meeting.execution.failed"), detail: safeError(error), currentTool: '',
+      }, safeError(error), 'error')
     } finally {
       const restartRequest = !runtime.abort.signal.aborted && !runtime.pauseRequested && (
         runtime.targetIds.size || runtime.adminCommands.length || runtime.summaryRequested
       ) ? {
-          targetIds: [...runtime.targetIds], adminCommands: [...runtime.adminCommands],
+      targetIds: [...runtime.targetIds], adminCommands: [...runtime.adminCommands],
           summaryRequested: runtime.summaryRequested, triggerSource: runtime.triggerSource || 'human',
+          currentTaskId: meeting.run?.currentTaskId ?? null,
         } : null
       await Promise.allSettled([...runtime.activeRuns].map(run => run.dispose()))
       await Promise.allSettled([...runtime.agentHandles].map(handle => handle.dispose()))
+      for (const handle of runtime.agentHandles) arenaSessionContexts.delete(String(handle.agent.id))
       if (runtime.parent) await runtime.parent.dispose().catch(() => undefined)
       runtimes.delete(meeting.id)
       if (restartRequest) enqueueMeetingRun(meeting, restartRequest)
       else meeting.status = 'paused'
+      updateRun(meeting, restartRequest ? 'queued' : 'paused', restartRequest ? 'queued' : runtime.abort.signal.aborted ? 'interrupted' : 'idle')
       meeting.participants = meeting.participants.map(item => ({ ...item, status: 'idle' }))
       meeting.updatedAt = nowIso()
       await persist().catch(() => undefined)
@@ -1764,8 +2329,10 @@ export function apply(ctx, config = {}) {
       adminCommands,
       summaryRequested: previous?.summaryRequested === true || request.summaryRequested === true,
       triggerSource: request.triggerSource || previous?.triggerSource || 'human',
+      currentTaskId: request.currentTaskId ?? previous?.currentTaskId ?? meeting.run?.currentTaskId ?? null,
     })
     meeting.status = 'queued'
+    updateRun(meeting, 'queued', request.currentTaskId ? 'task' : 'queued', request.currentTaskId ?? meeting.run?.currentTaskId ?? null)
     meeting.error = null
     if (meeting.collaborationStage === 'completed') meeting.collaborationStage = 'waiting-human'
     if (!queue.includes(meeting.id)) queue.push(meeting.id)
@@ -1773,13 +2340,18 @@ export function apply(ctx, config = {}) {
 
   async function createMeeting(raw) {
     let input
-    try { input = validateMeetingInput(raw) } catch (error) { throw new HttpError(400, safeError(error)) }
+    try { input = validateMeetingInput(raw) } catch (error) { throw new HttpError(400, error.i18n ? uiMessage(error.i18n.key, error.i18n.params) : safeError(error)) }
+    const workdir = await normalizeRoomWorkdir(raw?.workdir)
     const createdAt = nowIso()
     const meeting = {
       id: randomUUID(), ...input, participants: input.participants.map(item => ({ ...item, status: 'idle' })),
       administratorProfile: administratorSnapshot(), humanProfile: { ...profiles.human }, status: 'queued', turnCount: 0,
       createdAt, updatedAt: createdAt, transcript: [], mutedParticipantIds: [], userVote: null, verdict: null, error: null,
-      collaborationStage: 'discussion', tasks: [], decisions: [], artifacts: [],
+      collaborationStage: 'discussion', tasks: [], decisions: [], artifacts: [], workdir,
+      contextSettings: { autoCompressEnabled: false, autoCompressThreshold: 80 }, contextSummary: '',
+      contextCompressionCount: 0, run: { id: randomUUID(), status: 'queued', phase: 'queued', currentTaskId: null, lastTargetIds: [], attempt: 0, startedAt: null, updatedAt: createdAt },
+      permissions: Object.fromEntries([['administrator', 'danger-full-access'], ...input.participants.map(item => [item.id, 'danger-full-access'])]),
+      capabilities: Object.fromEntries([['administrator', normalizeCapabilities()], ...input.participants.map(item => [item.id, normalizeCapabilities(item.capabilities)])]),
     }
     ensureActivityMonitor(meeting)
     meetings.set(meeting.id, meeting)
@@ -1793,14 +2365,48 @@ export function apply(ctx, config = {}) {
     const requestedIds = [...new Set(Array.isArray(raw?.profileIds) ? raw.profileIds.map(String) : [])]
     const existingIds = new Set(meeting.participants.map(item => item.id))
     const newIds = requestedIds.filter(id => !existingIds.has(id))
-    if (!newIds.length) throw new HttpError(400, '请选择尚未加入会议的 AI 用户')
-    if (meeting.participants.length + newIds.length > 12) throw new HttpError(400, '一场会议最多允许 12 位 AI 用户')
+    if (!newIds.length) throw new HttpError(400, uiMessage("addmeetingmembers.select.ai.users.who.have.not.joined.this.meeting"))
+    if (meeting.participants.length + newIds.length > 12) throw new HttpError(400, uiMessage("addmeetingmembers.a.meeting.can.have.up.to.12.ai.users"))
     const invited = newIds.map(id => profiles.aiUsers.find(item => item.id === id))
-    if (invited.some(item => !item)) throw new HttpError(400, '邀请列表中包含已不存在的 AI 用户')
+    if (invited.some(item => !item)) throw new HttpError(400, uiMessage("addmeetingmembers.the.invitation.list.includes.ai.users.that.no.longer"))
     meeting.participants.push(...invited.map(item => ({ ...item, status: 'idle' })))
+    meeting.permissions ??= {}
+    for (const item of invited) meeting.permissions[item.id] = 'danger-full-access'
+    meeting.capabilities ??= {}
+    for (const item of invited) meeting.capabilities[item.id] = normalizeCapabilities(item.capabilities)
     ensureActivityMonitor(meeting)
-    appendSystem(meeting, `${invited.map(item => item.name).join('、')} 加入了会议。`, true)
+    appendSystem(meeting, uiMessage("addmeetingmembers.value.joined.the.meeting", { p0: invited.map(item => item.name).join('、') }), true)
     return meeting
+  }
+
+  async function setContainerPermission(container, raw) {
+    const profileId = String(raw?.profileId || '')
+    const target = permissionProfiles(container).find(item => item.id === profileId)
+    if (!target) throw new HttpError(400, uiMessage("setcontainerpermission.the.permission.target.is.not.a.member.of.this"))
+    const mode = normalizePermissionMode(raw?.mode)
+    container.permissions ??= {}
+    container.permissions[profileId] = mode
+    const runtime = runtimes.get(container.id) || roomRuntimes.get(container.id)
+    const pending = runtime?.roleAgents?.get(profileId)
+    if (pending) {
+      try { applyAgentPermission(await pending, mode) } catch { /* agent may be disposed between turns */ }
+    }
+    appendSystem(container, uiMessage("setcontainerpermission.value.s.permissions.have.been.set.to.value", { p0: target.name || 'AI', p1: AGENT_PERMISSION_LABELS[mode] }), Boolean(container.topic))
+    container.updatedAt = nowIso()
+    await persist()
+    return container
+  }
+
+  async function setContainerCapability(container, raw) {
+    const profileId = String(raw?.profileId || '')
+    const target = permissionProfiles(container).find(item => item.id === profileId)
+    const capability = String(raw?.capability || '')
+    if (!target || !ARENA_CAPABILITY_KEYS.includes(capability)) throw new HttpError(400, uiMessage("actonmeeting.invalid.capability"))
+    container.capabilities ??= {}
+    container.capabilities[profileId] = { ...capabilityFor(container, profileId), [capability]: raw.enabled === true }
+    container.updatedAt = nowIso()
+    await persist()
+    return container
   }
 
   async function actOnMeeting(meeting, body) {
@@ -1808,17 +2414,27 @@ export function apply(ctx, config = {}) {
     const runtime = runtimes.get(meeting.id)
     let shouldPump = false
     if (action === 'pause') {
-      if (!runtime || meeting.status !== 'running') throw new HttpError(409, '当前没有正在进行的 AI 发言')
+      if (!runtime || meeting.status !== 'running') throw new HttpError(409, uiMessage("actonmeeting.no.ai.reply.is.currently.in.progress"))
       runtime.pauseRequested = true
       meeting.status = 'pausing'
-    } else if (action === 'resume' || action === 'reopen') {
-      const targets = meeting.participants.filter(item => !isMuted(meeting, item.id)).map(item => item.id)
+      updateRun(meeting, 'pausing', meeting.run?.phase ?? 'working')
+    } else if (action === 'resume' || action === 'reopen' || action === 'retry') {
+      ensureMeetingWorkspace(meeting)
+      const task = meeting.tasks?.find(item => item.id === meeting.run?.currentTaskId && item.status === 'in-progress')
+      const available = meeting.participants.filter(item => !isMuted(meeting, item.id)).map(item => item.id)
+      const targets = task?.assigneeId && task.assigneeId !== 'administrator' && !isMuted(meeting, task.assigneeId)
+        ? [task.assigneeId]
+        : action === 'retry' || (meeting.run.phase === 'interrupted' && meeting.run.lastTargetIds.length)
+          ? meeting.run.lastTargetIds.filter(id => available.includes(id))
+          : available
+      if (!targets.length) throw new HttpError(409, uiMessage("actonmeeting.no.roles.available.to.retry"))
+      if (action === 'retry') meeting.run.attempt += 1
       if (runtime) {
         runtime.triggerSource = 'human'
         targets.forEach(id => runtime.targetIds.add(id))
         wakeRuntime(meeting, runtime)
       } else {
-        enqueueMeetingRun(meeting, { targetIds: targets, triggerSource: 'human' })
+        enqueueMeetingRun(meeting, { targetIds: targets, currentTaskId: task?.id ?? null, triggerSource: 'human' })
         shouldPump = true
       }
     } else if (action === 'finish' || action === 'summarize') {
@@ -1830,11 +2446,12 @@ export function apply(ctx, config = {}) {
         shouldPump = true
       }
     } else if (action === 'stop') {
-      if (!BUSY_MEETING_STATUSES.has(meeting.status)) throw new HttpError(409, '当前没有需要停止的 AI 工作')
+      if (!BUSY_MEETING_STATUSES.has(meeting.status)) throw new HttpError(409, uiMessage("actonmeeting.there.is.no.ai.work.to.stop"))
       if (!runtime && meeting.status === 'queued') {
         pendingMeetingStarts.delete(meeting.id)
         for (let index = queue.length - 1; index >= 0; index -= 1) if (queue[index] === meeting.id) queue.splice(index, 1)
         meeting.status = 'paused'
+        updateRun(meeting, 'paused', 'idle')
       } else if (runtime) {
         runtime.cancelCurrentWork = true
         runtime.pauseRequested = true
@@ -1842,17 +2459,18 @@ export function apply(ctx, config = {}) {
         runtime.targetIds.clear()
         runtime.adminCommands.length = 0
         meeting.status = 'pausing'
+        updateRun(meeting, 'pausing', meeting.run?.phase ?? 'working')
         for (const run of runtime.activeRuns) void run.dispose().catch(() => undefined)
         for (const pending of runtime.roleAgents.values()) {
           void pending.then(handle => handle.agent.cancel({ kind: 'user' }, { keepInbox: false })).catch(() => undefined)
         }
       } else {
-        throw new HttpError(409, '当前工作状态已经变化，请稍后重试')
+        throw new HttpError(409, uiMessage("actonmeeting.the.work.state.has.changed.please.try.again"))
       }
-      appendSystem(meeting, '人类用户停止了当前 AI 工作；会议仍然保留，可以随时发送下一条消息。', true)
+      appendSystem(meeting, uiMessage("actonmeeting.the.human.user.stopped.the.current.ai.work.the"), true)
     } else if (action === 'intervene' || action === 'send') {
       const text = typeof body.text === 'string' ? body.text.trim().slice(0, 4000) : ''
-      if (!text) throw new HttpError(400, '消息不能为空')
+      if (!text) throw new HttpError(400, uiMessage("actonmeeting.the.message.cannot.be.empty"))
       meeting.transcript.push({
         id: randomUUID(), kind: 'user', speakerId: 'human', speaker: profiles.human.name,
         avatar: profiles.human.avatar, text, createdAt: nowIso(),
@@ -1886,14 +2504,46 @@ export function apply(ctx, config = {}) {
       }
     } else if (action === 'invite-members') {
       addMeetingMembers(meeting, body)
+    } else if (action === 'set-permission') {
+      await setContainerPermission(meeting, body)
+    } else if (action === 'set-capability') {
+      await setContainerCapability(meeting, body)
+    } else if (action === 'compress-context') {
+      ensureMeetingWorkspace(meeting)
+      const profileId = String(body.profileId || 'administrator')
+      await compactRoleSession(meeting, profileId, new AbortController().signal)
+    } else if (action === 'set-context-settings') {
+      ensureMeetingWorkspace(meeting)
+      meeting.contextSettings = {
+        autoCompressEnabled: body.autoCompressEnabled === true,
+        autoCompressThreshold: Math.max(50, Math.min(95, Math.round(Number(body.autoCompressThreshold) || 80))),
+      }
     } else if (action === 'set-stage') {
       const stage = String(body.stage ?? '')
-      if (!MEETING_STAGES.includes(stage) || stage === 'completed') throw new HttpError(400, '协作阶段无效')
+      if (!MEETING_STAGES.includes(stage) || stage === 'completed') throw new HttpError(400, uiMessage("actonmeeting.invalid.collaboration.stage"))
       meeting.collaborationStage = stage
+    } else if (action === 'approval') {
+      await resolveArenaApproval(meeting, body)
     } else if (action === 'task-create') {
       createWorkspaceTask(meeting, body, 'human')
     } else if (action === 'task-update') {
-      updateWorkspaceTask(meeting, body)
+      const task = updateWorkspaceTask(meeting, body)
+      if (task.status === 'in-progress' && String(body.status) === 'in-progress') {
+        const assigneeId = task.assigneeId
+        if (assigneeId && assigneeId !== 'administrator' && !isMuted(meeting, assigneeId)) {
+          updateRun(meeting, runtime ? 'running' : 'queued', 'task', task.id)
+          if (runtime) {
+            runtime.targetIds.add(assigneeId)
+            runtime.triggerSource = 'human'
+            wakeRuntime(meeting, runtime)
+          } else {
+            enqueueMeetingRun(meeting, { targetIds: [assigneeId], currentTaskId: task.id, triggerSource: 'human' })
+            shouldPump = true
+          }
+        }
+      } else if (meeting.run?.currentTaskId === task.id && ['done', 'paused', 'blocked', 'review'].includes(task.status)) {
+        updateRun(meeting, meeting.status, 'idle', null)
+      }
     } else if (action === 'task-delete') {
       deleteWorkspaceTask(meeting, body)
     } else if (action === 'decision-create') {
@@ -1901,17 +2551,17 @@ export function apply(ctx, config = {}) {
     } else if (action === 'decision-choose') {
       const decision = chooseWorkspaceDecision(meeting, body, 'human')
       const selected = decision.options.find(item => item.id === decision.selectedOptionId)
-      appendSystem(meeting, `人类用户为“${decision.title}”选择了方案：${selected?.label || '未知方案'}。`, true)
+      appendSystem(meeting, uiMessage("actonmeeting.the.human.user.chose.an.option.for.value.value", { p0: decision.title, p1: selected?.label || '未知方案' }), true)
     } else if (action === 'decision-reopen') {
       const decision = reopenWorkspaceDecision(meeting, body)
-      appendSystem(meeting, `人类用户重开了决策“${decision.title}”。`, true)
+      appendSystem(meeting, uiMessage("actonmeeting.the.human.user.reopened.decision.value", { p0: decision.title }), true)
     } else if (action === 'decision-delete') {
       deleteWorkspaceDecision(meeting, body)
     } else if (action === 'artifact-create') {
       createWorkspaceArtifact(meeting, body, 'human')
     } else if (action === 'artifact-update') {
       const artifact = updateWorkspaceArtifact(meeting, body)
-      if (artifact.status === 'rejected') appendSystem(meeting, `人类用户驳回了成果“${artifact.title}”，需要继续修改。`, true)
+      if (artifact.status === 'rejected') appendSystem(meeting, uiMessage("actonmeeting.the.human.user.rejected.deliverable.value.further.changes.are", { p0: artifact.title }), true)
     } else if (action === 'artifact-delete') {
       deleteWorkspaceArtifact(meeting, body)
     } else if (action === 'request-evidence') {
@@ -1934,9 +2584,9 @@ export function apply(ctx, config = {}) {
       }
     } else if (action === 'vote') {
       const participantId = String(body.participantId ?? '')
-      if (!meeting.participants.some(item => item.id === participantId)) throw new HttpError(400, '投票目标无效')
+      if (!meeting.participants.some(item => item.id === participantId)) throw new HttpError(400, uiMessage("actonmeeting.invalid.vote.target"))
       meeting.userVote = participantId
-    } else throw new HttpError(400, '未知操作')
+    } else throw new HttpError(400, uiMessage("actonmeeting.unknown.action"))
     meeting.updatedAt = nowIso()
     await persist()
     if (shouldPump) pumpQueue()
@@ -1945,12 +2595,13 @@ export function apply(ctx, config = {}) {
 
   function roomOrThrow(id) {
     const room = rooms.get(id)
-    if (!room) throw new HttpError(404, '没有找到这个聊天')
+    if (!room) throw new HttpError(404, uiMessage("roomorthrow.this.chat.was.not.found"))
     return room
   }
 
   async function runRoomAi(room, profile, runtime) {
     if (isMuted(room, profile.id)) return
+    let failed = false
     room.respondingProfileIds = [...new Set([...(room.respondingProfileIds ?? []), profile.id])]
     room.respondingProfileId = room.respondingProfileIds[0] ?? null
     await persist()
@@ -1960,6 +2611,7 @@ export function apply(ctx, config = {}) {
       await persist()
       const result = await runFullAgentTurn(handle, chatPrompt(room, profile, coordinationPrompt(runtime, profile.id)), runtime, profile, 'work')
       if (!runtime.abort.signal.aborted && !isMuted(room, profile.id)) {
+        if (result.silent && !result.autonomousMessageIds.length) return
         if (!result.autonomousMessageIds.length) {
           if (!result.text) throw new Error(`本轮没有产生可展示文本，结束原因：${result.stopReason}`)
           room.messages.push({
@@ -1969,13 +2621,15 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch (error) {
-      setRoleActivity(room, profile, { status: 'error', stage: '本轮回复失败', detail: safeError(error), currentTool: '' }, safeError(error), 'error')
-      if (!runtime.abort.signal.aborted && !isMuted(room, profile.id)) appendSystem(room, `${profile.name} 回复失败：${safeError(error)}`, false)
+      failed = true
+      setRoleActivity(room, profile, { status: 'error', stage: uiMessage("runroomai.the.reply.failed.for.this.turn"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
       releaseRoleClaims(runtime, profile.id)
-      setRoleActivity(room, profile, isMuted(room, profile.id)
-        ? { status: 'muted', stage: '已静默', detail: '', currentTool: '', claimedFiles: [] }
-        : { status: 'idle', stage: '等待后续消息', detail: '', currentTool: '', claimedFiles: [] })
+      if (isMuted(room, profile.id)) {
+        setRoleActivity(room, profile, { status: 'muted', stage: uiMessage("role_activity.muted"), detail: '', currentTool: '', claimedFiles: [] })
+      } else if (!failed) {
+        setRoleActivity(room, profile, { status: 'idle', stage: uiMessage("runone.waiting.for.follow.up.messages"), detail: '', currentTool: '', claimedFiles: [] })
+      }
       room.respondingProfileIds = (room.respondingProfileIds ?? []).filter(id => id !== profile.id)
       room.respondingProfileId = room.respondingProfileIds[0] ?? null
       room.updatedAt = nowIso()
@@ -1985,7 +2639,8 @@ export function apply(ctx, config = {}) {
 
   async function runRoomAdmin(room, command, runtime) {
     const admin = room.administratorProfile
-    setRoleActivity(room, admin, { status: 'working', stage: '正在处理管理指令', detail: command.slice(0, 240), currentTool: '' }, '开始处理管理指令')
+    let failed = false
+    setRoleActivity(room, admin, { status: 'working', stage: uiMessage("runmeetingadmin.handling.an.administrator.command"), detail: command.slice(0, 240), currentTool: '' }, uiMessage("runmeetingadmin.started.handling.an.administrator.command"))
     try {
       const result = await askAdministrator(room, command, runtime.parent, runtime, false)
       room.messages.push({
@@ -1994,37 +2649,35 @@ export function apply(ctx, config = {}) {
       })
       if (result.action === 'change-topic' && result.topic.length >= 2) {
         room.name = result.topic.slice(0, 60)
-        appendSystem(room, `管理员已将群聊话题更改为：${room.name}`, false)
+        appendSystem(room, uiMessage("runroomadmin.the.administrator.changed.the.group.topic.to.value", { p0: room.name }), false)
       } else if (result.action === 'continue') room.participants.filter(item => !isMuted(room, item.id)).forEach(item => runtime.targetIds.add(item.id))
     } catch (error) {
-      appendSystem(room, `管理员处理失败：${safeError(error)}`, false)
-      setRoleActivity(room, admin, { status: 'error', stage: '管理指令处理失败', detail: safeError(error) }, safeError(error), 'error')
+      failed = true
+      setRoleActivity(room, admin, { status: 'error', stage: uiMessage("runmeetingadmin.the.administrator.command.failed"), detail: safeError(error) }, safeError(error), 'error')
     } finally {
-      setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (!failed) setRoleActivity(room, admin, { status: 'idle', stage: uiMessage("runmeetingadmin.waiting.for.an.administrator.command"), detail: '', currentTool: '' })
     }
   }
 
   async function evaluateRoomContinuation(room, completedIds, runtime, requirePeerReaction = false) {
     if (room.type !== 'group' || runtime.abort.signal.aborted) return
     const admin = room.administratorProfile
-    setRoleActivity(room, admin, { status: 'working', stage: '等待各角色判断是否接话', detail: '', currentTool: '' }, '启动逐角色接话判断')
+    setRoleActivity(room, admin, { status: 'working', stage: uiMessage("evaluatemeetingcontinuation.waiting.for.follow.up.checks"), detail: '', currentTool: '' }, uiMessage("evaluatemeetingcontinuation.started.per.role.follow.up.checks"))
     try {
       if (!profiles.settings.autoReplyEnabled) return
       const intents = (await collectReplyIntents(room, completedIds, runtime, false, requirePeerReaction)).filter(item => item.shouldSpeak)
-      const decision = profiles.settings.autoReplyDecisionMode === 'admin'
-        ? await guardContinuation(room, intents, runtime, false)
-        : await guardContinuation(room, intents.filter(item => !item.profile.autoReplyDisabled), runtime, false)
+      const decision = await guardContinuation(room, intents, runtime, false)
       if (decision.complete || !decision.onTopic) {
-        if (!decision.onTopic) appendSystem(room, '接话方向开始偏离人类当前焦点，AI 已停止自动接话。', false)
+        if (!decision.onTopic) appendSystem(room, uiMessage("evaluateroomcontinuation.automatic.ai.follow.ups.stopped.because.the.discussion.was"), false)
         return
       }
       const candidates = new Set(intents.map(item => item.profile.id))
       const next = decision.approvedSpeakerIds.filter(id => candidates.has(id) && !isMuted(room, id)).slice(0, 1)
       for (const id of next.length ? next : intents.slice(0, 1).map(item => item.profile.id)) runtime.targetIds.add(id)
     } catch (error) {
-      appendSystem(room, `逐角色接话判断失败，已先等待你的下一条消息：${safeError(error)}`, false)
+      setRoleActivity(room, admin, { status: 'error', stage: uiMessage("evaluatemeetingcontinuation.the.follow.up.check.process.failed"), detail: safeError(error), currentTool: '' }, safeError(error), 'error')
     } finally {
-      setRoleActivity(room, admin, { status: 'idle', stage: '等待管理指令', detail: '', currentTool: '' })
+      if (roleActivity(room, admin).status !== 'error') setRoleActivity(room, admin, { status: 'idle', stage: uiMessage("runmeetingadmin.waiting.for.an.administrator.command"), detail: '', currentTool: '' })
     }
   }
 
@@ -2034,7 +2687,8 @@ export function apply(ctx, config = {}) {
     room.updatedAt = nowIso()
     await persist()
     try {
-      runtime.parent = await createParent('Agent Arena social chat', runtime.abort.signal)
+      await normalizeRoomWorkdir(runtime.workdir)
+      runtime.parent = await createParent('Agent Arena social chat', runtime.abort.signal, runtime.workdir)
       while (!runtime.abort.signal.aborted) {
         while (runtime.adminCommands.length) await runRoomAdmin(room, runtime.adminCommands.shift(), runtime)
         const ids = [...runtime.targetIds].filter(id => !isMuted(room, id))
@@ -2052,7 +2706,12 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch (error) {
-      if (!runtime.abort.signal.aborted) appendSystem(room, `回复流程失败：${safeError(error)}`, false)
+      if (!runtime.abort.signal.aborted) {
+        const owner = room.administratorProfile || room.participants[0]
+        if (owner) setRoleActivity(room, owner, {
+          status: 'error', stage: uiMessage("runroomreplies.chat.execution.failed"), detail: safeError(error), currentTool: '',
+        }, safeError(error), 'error')
+      }
     } finally {
       room.status = 'idle'
       room.respondingProfileId = null
@@ -2061,6 +2720,7 @@ export function apply(ctx, config = {}) {
       await persist().catch(() => undefined)
       await Promise.allSettled([...runtime.activeRuns].map(run => run.dispose()))
       await Promise.allSettled([...runtime.agentHandles].map(handle => handle.dispose()))
+      for (const handle of runtime.agentHandles) arenaSessionContexts.delete(String(handle.agent.id))
       if (runtime.parent) await runtime.parent.dispose().catch(() => undefined)
       runtime.running = false
       if (runtime.targetIds.size || runtime.adminCommands.length) {
@@ -2069,6 +2729,7 @@ export function apply(ctx, config = {}) {
           targetIds: new Set(runtime.targetIds), adminCommands: [...runtime.adminCommands],
           parent: undefined, running: false, roleAgents: new Map(), agentHandles: new Set(), skipAutoContinuation: false,
           container: room, isMeeting: false, fileClaims: new Map(), triggerSource: runtime.triggerSource || 'auto',
+          workdir: runtimeWorkdir(room),
         }
         roomRuntimes.set(room.id, nextRuntime)
         void runRoomReplies(room, nextRuntime)
@@ -2083,6 +2744,7 @@ export function apply(ctx, config = {}) {
       runtime = {
         abort: new AbortController(), activeRuns: new Set(), targetIds: new Set(), adminCommands: [], parent: undefined, running: false,
         roleAgents: new Map(), agentHandles: new Set(), skipAutoContinuation: false, container: room, isMeeting: false, fileClaims: new Map(), triggerSource: 'human',
+        workdir: runtimeWorkdir(room),
       }
       roomRuntimes.set(room.id, runtime)
     }
@@ -2097,14 +2759,15 @@ export function apply(ctx, config = {}) {
   }
 
   async function createRoom(raw) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, '聊天配置必须是 JSON 对象')
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new HttpError(400, uiMessage("createroom.the.chat.configuration.must.be.a.json.object"))
+    const workdir = await normalizeRoomWorkdir(raw.workdir)
     const type = raw.type === 'group' ? 'group' : 'direct'
     const profileIds = [...new Set(Array.isArray(raw.profileIds) ? raw.profileIds.map(String) : [])]
     if ((type === 'direct' && profileIds.length !== 1) || (type === 'group' && (profileIds.length < 2 || profileIds.length > 12))) {
-      throw new HttpError(400, type === 'direct' ? '私聊必须选择 1 个 AI 用户' : '群聊必须选择 2 到 12 个 AI 用户')
+      throw new HttpError(400, type === 'direct' ? uiMessage("createroom.select.exactly.1.ai.user.for.a.direct.chat") : uiMessage("createroom.select.2.12.ai.users.for.a.group.chat"))
     }
     const participants = profileIds.map(id => profiles.aiUsers.find(item => item.id === id))
-    if (participants.some(item => !item)) throw new HttpError(400, '聊天中包含已不存在的 AI 用户')
+    if (participants.some(item => !item)) throw new HttpError(400, uiMessage("createroom.the.chat.includes.ai.users.that.no.longer.exist"))
     const nameInput = typeof raw.name === 'string' ? raw.name.trim().slice(0, 60) : ''
     const createdAt = nowIso()
     const room = {
@@ -2112,7 +2775,7 @@ export function apply(ctx, config = {}) {
       name: nameInput || (type === 'direct' ? participants[0].name : `${participants.map(item => item.name).join('、')}的小群`),
       participants: participants.map(item => ({ ...item })), humanProfile: { ...profiles.human },
       administratorProfile: type === 'group' ? administratorSnapshot() : null,
-      messages: [], mutedParticipantIds: [], status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
+      messages: [], workdir, mutedParticipantIds: [], permissions: Object.fromEntries([...(type === 'group' ? [['administrator', 'danger-full-access']] : []), ...participants.map(item => [item.id, 'danger-full-access'])]), capabilities: Object.fromEntries([...(type === 'group' ? [['administrator', normalizeCapabilities()]] : []), ...participants.map(item => [item.id, normalizeCapabilities(item.capabilities)])]), status: 'idle', respondingProfileId: null, respondingProfileIds: [], createdAt, updatedAt: createdAt,
     }
     ensureActivityMonitor(room)
     rooms.set(room.id, room)
@@ -2122,7 +2785,7 @@ export function apply(ctx, config = {}) {
 
   async function sendRoomMessage(room, raw) {
     const text = typeof raw?.text === 'string' ? raw.text.trim().slice(0, 4000) : ''
-    if (!text) throw new HttpError(400, '消息不能为空')
+    if (!text) throw new HttpError(400, uiMessage("actonmeeting.the.message.cannot.be.empty"))
     room.messages.push({ id: randomUUID(), kind: 'human', senderId: 'human', senderName: profiles.human.name, avatar: profiles.human.avatar, text, createdAt: nowIso() })
     room.humanProfile = { ...profiles.human }
     const runtime = roomRuntimes.get(room.id)
@@ -2134,12 +2797,12 @@ export function apply(ctx, config = {}) {
   }
 
   async function retryRoomMessage(room) {
-    if (roomRuntimes.has(room.id) || room.status === 'responding') throw new HttpError(409, 'AI 正在处理当前消息，请稍候')
+    if (roomRuntimes.has(room.id) || room.status === 'responding') throw new HttpError(409, uiMessage("retryroommessage.ai.users.are.processing.the.current.message.please.wait"))
     const latest = [...room.messages].reverse().find(item => item.kind === 'human')
-    if (!latest) throw new HttpError(400, '这个聊天里还没有可重试的人类消息')
+    if (!latest) throw new HttpError(400, uiMessage("retryroommessage.there.are.no.human.messages.to.retry.in.this"))
     const directives = parseSpeechDirectives(latest.text, room.participants)
-    if (directives.commandOnly) throw new HttpError(400, '上一条消息只是发言控制指令，不需要重试')
-    appendSystem(room, '正在重新请求上一条消息。', false)
+    if (directives.commandOnly) throw new HttpError(400, uiMessage("retryroommessage.the.last.message.was.only.a.speaking.control.command"))
+    appendSystem(room, uiMessage("retryroommessage.retrying.the.last.message"), false)
     room.updatedAt = nowIso()
     await persist()
     queueRoomReplies(room, latest.text, directives)
@@ -2147,35 +2810,37 @@ export function apply(ctx, config = {}) {
   }
 
   async function renameRoom(room, raw) {
-    const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 80) : ''
-    if (!name) throw new HttpError(400, '聊天名称不能为空')
-    room.name = name
+    const patch = await conversationSettingsPatch(raw)
+    Object.assign(room, patch)
     room.updatedAt = nowIso()
     await persist()
     return room
   }
 
   async function addRoomMembers(room, raw) {
-    if (room.type !== 'group') throw new HttpError(409, '只有群聊可以邀请新成员')
+    if (room.type !== 'group') throw new HttpError(409, uiMessage("addroommembers.only.group.chats.support.inviting.new.members"))
     const requestedIds = [...new Set(Array.isArray(raw?.profileIds) ? raw.profileIds.map(String) : [])]
     const existingIds = new Set(room.participants.map(item => item.id))
     const newIds = requestedIds.filter(id => !existingIds.has(id))
-    if (!newIds.length) throw new HttpError(400, '请选择尚未加入群聊的 AI 用户')
-    if (room.participants.length + newIds.length > 12) throw new HttpError(400, '一个群聊最多允许 12 位 AI 用户')
+    if (!newIds.length) throw new HttpError(400, uiMessage("addroommembers.select.ai.users.who.have.not.joined.this.group"))
+    if (room.participants.length + newIds.length > 12) throw new HttpError(400, uiMessage("addroommembers.a.group.chat.can.have.up.to.12.ai"))
     const invited = newIds.map(id => profiles.aiUsers.find(item => item.id === id))
-    if (invited.some(item => !item)) throw new HttpError(400, '邀请列表中包含已不存在的 AI 用户')
+    if (invited.some(item => !item)) throw new HttpError(400, uiMessage("addmeetingmembers.the.invitation.list.includes.ai.users.that.no.longer"))
     room.participants.push(...invited.map(item => ({ ...item })))
+    room.permissions ??= {}
+    for (const item of invited) room.permissions[item.id] = 'danger-full-access'
+    room.capabilities ??= {}
+    for (const item of invited) room.capabilities[item.id] = normalizeCapabilities(item.capabilities)
     ensureActivityMonitor(room)
-    appendSystem(room, `${invited.map(item => item.name).join('、')} 加入了群聊。`, false)
+    appendSystem(room, uiMessage("addroommembers.value.joined.the.group", { p0: invited.map(item => item.name).join('、') }), false)
     room.updatedAt = nowIso()
     await persist()
     return room
   }
 
   async function renameMeeting(meeting, raw) {
-    const name = typeof raw?.name === 'string' ? raw.name.trim().slice(0, 80) : ''
-    if (!name) throw new HttpError(400, '会议名称不能为空')
-    meeting.displayName = name
+    const patch = await conversationSettingsPatch(raw, 'displayName')
+    Object.assign(meeting, patch)
     meeting.updatedAt = nowIso()
     await persist()
     return meeting
@@ -2183,7 +2848,7 @@ export function apply(ctx, config = {}) {
 
   async function deleteMeeting(meeting) {
     if (BUSY_MEETING_STATUSES.has(meeting.status) || runtimes.has(meeting.id)) {
-      throw new HttpError(409, 'AI 正在工作，请先停止当前工作再删除会议')
+      throw new HttpError(409, uiMessage("deletemeeting.ai.users.are.working.stop.the.current.work.before"))
     }
     pendingMeetingStarts.delete(meeting.id)
     meetings.delete(meeting.id)
@@ -2192,7 +2857,7 @@ export function apply(ctx, config = {}) {
 
   function meetingOrThrow(id) {
     const meeting = meetings.get(id)
-    if (!meeting) throw new HttpError(404, '没有找到这场会议')
+    if (!meeting) throw new HttpError(404, uiMessage("meetingorthrow.this.meeting.was.not.found"))
     return meeting
   }
 
@@ -2238,7 +2903,7 @@ export function apply(ctx, config = {}) {
         if (method === 'POST' && suffix === '/rooms') {
           respond(res, 201, { room: publicMeeting(await createRoom(await readJsonBody(req))) }); return
         }
-        const roomMatch = /^\/rooms\/([^/]+)(?:\/(messages|members|retry))?$/.exec(suffix)
+        const roomMatch = /^\/rooms\/([^/]+)(?:\/(messages|members|retry|actions))?$/.exec(suffix)
         if (roomMatch) {
           const room = roomOrThrow(decodeURIComponent(roomMatch[1]))
           if (method === 'GET' && !roomMatch[2]) { respond(res, 200, { room: publicMeeting(room) }); return }
@@ -2246,23 +2911,42 @@ export function apply(ctx, config = {}) {
           if (method === 'POST' && suffix.endsWith('/messages')) { respond(res, 202, { room: publicMeeting(await sendRoomMessage(room, await readJsonBody(req))) }); return }
           if (method === 'POST' && suffix.endsWith('/members')) { respond(res, 200, { room: publicMeeting(await addRoomMembers(room, await readJsonBody(req))) }); return }
           if (method === 'POST' && suffix.endsWith('/retry')) { respond(res, 202, { room: publicMeeting(await retryRoomMessage(room)) }); return }
+          if (method === 'POST' && suffix.endsWith('/actions')) {
+            const body = await readJsonBody(req)
+            if (String(body?.action || '') === 'set-permission') await setContainerPermission(room, body)
+            else if (String(body?.action || '') === 'set-capability') await setContainerCapability(room, body)
+            else if (String(body?.action || '') === 'approval') await resolveArenaApproval(room, body)
+            else throw new HttpError(400, uiMessage("apply.unknown.chat.action"))
+            respond(res, 200, { room: publicMeeting(room) }); return
+          }
           if (method === 'DELETE' && !roomMatch[2]) {
             const runtime = roomRuntimes.get(room.id)
             if (runtime) runtime.abort.abort(new Error('Deleted by user'))
             rooms.delete(room.id); await persist(); respond(res, 200, { ok: true }); return
           }
         }
-        const match = /^\/meetings\/([^/]+)(?:\/actions)?$/.exec(suffix)
+        const match = /^\/meetings\/([^/]+)(?:\/(actions|context))?$/.exec(suffix)
         if (match) {
           const meeting = meetingOrThrow(decodeURIComponent(match[1]))
+          if (method === 'GET' && suffix.endsWith('/context')) {
+            const administratorEstimate = estimateMeetingContext(meeting, contextWindowFor(meeting.administratorProfile), 'administrator')
+            respond(res, 200, { context: publicMeeting({
+              ...administratorEstimate,
+              summary: getMeetingContextState(meeting, 'administrator').summary,
+              summaryUpdatedAt: getMeetingContextState(meeting, 'administrator').summaryUpdatedAt,
+              compressionCount: getMeetingContextState(meeting, 'administrator').compressionCount,
+              roles: contextSnapshotFor(meeting),
+              settings: meeting.contextSettings,
+            }) }); return
+          }
           if (method === 'GET' && !suffix.endsWith('/actions')) { respond(res, 200, { meeting: publicMeeting(meeting) }); return }
           if (method === 'PATCH' && !suffix.endsWith('/actions')) { respond(res, 200, { meeting: publicMeeting(await renameMeeting(meeting, await readJsonBody(req))) }); return }
           if (method === 'DELETE' && !suffix.endsWith('/actions')) { await deleteMeeting(meeting); respond(res, 200, { ok: true }); return }
           if (method === 'POST' && suffix.endsWith('/actions')) { respond(res, 200, { meeting: publicMeeting(await actOnMeeting(meeting, await readJsonBody(req))) }); return }
         }
-        throw new HttpError(404, '接口不存在')
+        throw new HttpError(404, uiMessage("apply.this.endpoint.does.not.exist"))
       } catch (error) {
-        respond(res, Number(error?.status) || 500, { error: safeError(error) })
+        respond(res, Number(error?.status) || 500, { error: safeError(error), ...(error?.i18n ? { errorI18n: error.i18n } : {}) })
       }
     },
   }), 'agent-arena: HTTP API')
